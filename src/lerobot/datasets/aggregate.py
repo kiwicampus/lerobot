@@ -197,6 +197,12 @@ def update_meta_data(
     df["data/chunk_index"] = df["data/chunk_index"] + data_idx["chunk"]
     df["data/file_index"] = df["data/file_index"] + data_idx["file"]
     for key, video_idx in videos_idx.items():
+        # CONFLICT RESOLUTION (cherry-pick 90684a96 on top of local 96516e34):
+        # Upstream's vectorized rewrite of this loop drops the per-source-file
+        # `src_to_offset` logic added by our fork to handle source datasets
+        # that span multiple video shards. Keeping the local version preserves
+        # correctness; Phase 3 can vectorize the `if src_to_offset` branch
+        # separately (see plan).
         # Store original video file indices before updating
         orig_chunk_col = f"videos/{key}/chunk_index"
         orig_file_col = f"videos/{key}/file_index"
