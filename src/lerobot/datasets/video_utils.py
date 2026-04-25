@@ -333,11 +333,16 @@ def encode_video_frames(
         )
         pix_fmt = "yuv420p"
 
-    # Get input frames
-    template = "frame-" + ("[0-9]" * 6) + ".png"
-    input_list = sorted(
-        glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
-    )
+    # Get input frames. New byte-based conversion writes JPEG frames, while the legacy path writes PNGs.
+    input_list = []
+    for suffix in ("jpg", "png"):
+        template = "frame-" + ("[0-9]" * 6) + f".{suffix}"
+        input_list = sorted(
+            glob.glob(str(imgs_dir / template)),
+            key=lambda x: int(Path(x).stem.split("-")[-1]),
+        )
+        if input_list:
+            break
 
     # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
@@ -660,7 +665,7 @@ class VideoEncodingManager:
                 # encode_on_exit is False, skip encoding but warn user
                 logging.info(
                     f"Skipping video encoding on exit (encode_on_exit=False). "
-                    f"{self.dataset.episodes_since_last_encoding} episodes with PNGs remain on disk. "
+                    f"{self.dataset.episodes_since_last_encoding} episodes with image frames remain on disk. "
                     f"Use dataset.encode_pending_videos() to encode them later."
                 )
 
@@ -682,14 +687,14 @@ class VideoEncodingManager:
 
         # Clean up any remaining images directory if it's empty
         img_dir = self.dataset.root / "images"
-        # Check for any remaining PNG files
-        png_files = list(img_dir.rglob("*.png"))
-        if len(png_files) == 0:
-            # Only remove the images directory if no PNG files remain
+        # Check for any remaining frame files
+        frame_files = list(img_dir.rglob("*.png")) + list(img_dir.rglob("*.jpg"))
+        if len(frame_files) == 0:
+            # Only remove the images directory if no frame files remain
             if img_dir.exists():
                 shutil.rmtree(img_dir)
                 logging.debug("Cleaned up empty images directory")
         else:
-            logging.debug(f"Images directory is not empty, containing {len(png_files)} PNG files")
+            logging.debug(f"Images directory is not empty, containing {len(frame_files)} frame files")
 
         return False  # Don't suppress the original exception

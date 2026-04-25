@@ -63,6 +63,7 @@ DEFAULT_EPISODES_PATH = EPISODES_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_DATA_PATH = DATA_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_VIDEO_PATH = VIDEO_DIR + "/{video_key}/" + CHUNK_FILE_PATTERN + ".mp4"
 DEFAULT_IMAGE_PATH = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png"
+DEFAULT_IMAGE_PATH_JPG = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.jpg"
 
 LEGACY_EPISODES_PATH = "meta/episodes.jsonl"
 LEGACY_EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
@@ -1074,11 +1075,14 @@ def validate_feature_numpy_array(
 
 
 def validate_feature_image_or_video(
-    name: str, expected_shape: list[str], value: np.ndarray | PILImage.Image
+    name: str,
+    expected_shape: list[str],
+    value: np.ndarray | PILImage.Image | bytes | bytearray,
 ) -> str:
     """Validate a feature that is expected to be an image or video frame.
 
-    Accepts `np.ndarray` (channel-first or channel-last) or `PIL.Image.Image`.
+    Accepts `np.ndarray` (channel-first or channel-last), `PIL.Image.Image`, or raw encoded image
+    bytes. Byte payloads are assumed to match the feature shape established when the dataset was created.
 
     Args:
         name (str): The name of the feature.
@@ -1097,8 +1101,10 @@ def validate_feature_image_or_video(
             error_message += f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape '{(c, h, w)}' or '{(h, w, c)}'.\n"
     elif isinstance(value, PILImage.Image):
         pass
+    elif isinstance(value, (bytes, bytearray)):
+        pass
     else:
-        error_message += f"The feature '{name}' is expected to be of type 'PIL.Image' or 'np.ndarray' channel first or channel last, but type '{type(value)}' provided instead.\n"
+        error_message += f"The feature '{name}' is expected to be of type 'PIL.Image', 'np.ndarray' channel first or channel last, or encoded bytes, but type '{type(value)}' provided instead.\n"
 
     return error_message
 
