@@ -233,6 +233,9 @@ def merge_datasets(
     datasets: list[LeRobotDataset],
     output_repo_id: str,
     output_dir: str | Path | None = None,
+    data_files_size_in_mb: float | None = None,
+    video_files_size_in_mb: float | None = None,
+    chunk_size: int | None = None,
 ) -> LeRobotDataset:
     """Merge multiple LeRobotDatasets into a single dataset.
 
@@ -242,6 +245,10 @@ def merge_datasets(
         datasets: List of LeRobotDatasets to merge.
         output_repo_id: Repository ID for the merged dataset.
         output_dir: Directory to save the merged dataset. If None, uses default location.
+        data_files_size_in_mb: Optional cap for data parquet shard size (defaults per aggregate_datasets).
+        video_files_size_in_mb: Optional cap for concatenated video file size before rotation.
+            Larger values reduce mid-merge file splits (helps multi-camera datasets).
+        chunk_size: Optional chunk directory layout parameter for aggregated outputs.
     """
     if not datasets:
         raise ValueError("No datasets to merge")
@@ -256,6 +263,9 @@ def merge_datasets(
         aggr_repo_id=output_repo_id,
         roots=roots,
         aggr_root=output_dir,
+        data_files_size_in_mb=data_files_size_in_mb,
+        video_files_size_in_mb=video_files_size_in_mb,
+        chunk_size=chunk_size,
     )
 
     merged_dataset = LeRobotDataset(

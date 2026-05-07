@@ -118,6 +118,10 @@ class EditDatasetConfig:
     root: str | None = None
     new_repo_id: str | None = None
     push_to_hub: bool = False
+    # Passed through to aggregate_datasets when operation.type == merge (optional).
+    data_files_size_in_mb: float | None = None
+    video_files_size_in_mb: float | None = None
+    chunk_size: int | None = None
 
 
 def get_output_path(repo_id: str, new_repo_id: str | None, root: Path | None) -> tuple[str, Path]:
@@ -215,6 +219,9 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
         datasets,
         output_repo_id=cfg.repo_id,
         output_dir=output_dir,
+        data_files_size_in_mb=cfg.data_files_size_in_mb,
+        video_files_size_in_mb=cfg.video_files_size_in_mb,
+        chunk_size=cfg.chunk_size,
     )
 
     logging.info(f"Merged dataset saved to {output_dir}")
