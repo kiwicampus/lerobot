@@ -327,6 +327,8 @@ def encode_video_frames(
     fast_decode: int = 0,
     log_level: int | None = av.logging.ERROR,
     overwrite: bool = False,
+    bitrate: str = "8M",
+    preset: str | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     # Check encoder availability
@@ -387,18 +389,18 @@ def encode_video_frames(
             video_options["rc"] = "vbr"  # variable bitrate
             video_options["cq"] = str(crf if crf is not None else 23)
         elif vcodec in ["h264_nvmpi", "hevc_nvmpi"]:
-            # Jetson nvmpi: use bitrate (no CRF support)
-            video_options["b"] = "8M"  # 8 Mbps for good quality
+            # Jetson nvmpi: use bitrate (no CRF support); controllable via `bitrate` kwarg.
+            video_options["b"] = bitrate
         else:
             # V4L2/OMX: use bitrate
-            video_options["b"] = "4M"  # 4 Mbps default
+            video_options["b"] = bitrate
     else:
         # Software encoders
         if crf is not None:
             video_options["crf"] = str(crf)
         # libx264: use faster preset for quicker encoding
         if vcodec == "libx264":
-            video_options["preset"] = "fast"
+            video_options["preset"] = "fast" if preset is None else preset
 
     if fast_decode and not is_hw_encoder:
         key = "svtav1-params" if vcodec == "libsvtav1" else "tune"

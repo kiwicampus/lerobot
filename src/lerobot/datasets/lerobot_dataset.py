@@ -1528,7 +1528,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
         vcodec = getattr(self, "vcodec", "libsvtav1")
-        encode_video_frames(img_dir, temp_path, self.fps, vcodec=vcodec, overwrite=True)
+        encoding_kwargs = getattr(self, "encoding_kwargs", None) or {}
+        encode_video_frames(
+            img_dir, temp_path, self.fps, vcodec=vcodec, overwrite=True, **encoding_kwargs
+        )
         shutil.rmtree(img_dir)
         return temp_path
 
