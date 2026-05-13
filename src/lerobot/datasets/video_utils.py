@@ -43,6 +43,22 @@ def get_safe_default_codec():
         return "pyav"
 
 
+def _pyav_codec_display_name(codec: Any) -> str:
+    """Return a stable codec id string across PyAV versions.
+
+    PyAV 10 exposes ``Codec.name``; newer releases add ``Codec.canonical_name``.
+    """
+    if codec is None:
+        return "unknown"
+    canonical = getattr(codec, "canonical_name", None)
+    if canonical:
+        return str(canonical)
+    name = getattr(codec, "name", None)
+    if name:
+        return str(name)
+    return "unknown"
+
+
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],
@@ -311,11 +327,19 @@ def encode_video_frames(
     fast_decode: int = 0,
     log_level: int | None = av.logging.ERROR,
     overwrite: bool = False,
+    bitrate: str = "8M",
+    preset: str | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     # Check encoder availability
-    if vcodec not in ["h264", "hevc", "libsvtav1"]:
-        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
+    # Hardware encoders: h264_nvmpi (Jetson), h264_nvenc (NVIDIA desktop), h264_v4l2m2m, h264_omx
+    supported_codecs = [
+        "h264", "hevc", "libsvtav1", "libx264",
+        "h264_nvmpi", "hevc_nvmpi",  # Jetson hardware (jetson-ffmpeg)
+        "h264_nvenc", "h264_v4l2m2m", "h264_omx",
+    ]
+    if vcodec not in supported_codecs:
+        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: {supported_codecs}.")
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
@@ -352,14 +376,33 @@ def encode_video_frames(
 
     # Define video codec options
     video_options = {}
+    is_hw_encoder = vcodec in ["h264_nvenc", "h264_v4l2m2m", "h264_omx", "h264_nvmpi", "hevc_nvmpi"]
 
     if g is not None:
         video_options["g"] = str(g)
 
-    if crf is not None:
-        video_options["crf"] = str(crf)
+    if is_hw_encoder:
+        # Hardware encoders use bitrate instead of CRF
+        if vcodec == "h264_nvenc":
+            # NVENC: use constant quality mode (cq) or variable bitrate
+            video_options["preset"] = "p4"  # balanced speed/quality
+            video_options["rc"] = "vbr"  # variable bitrate
+            video_options["cq"] = str(crf if crf is not None else 23)
+        elif vcodec in ["h264_nvmpi", "hevc_nvmpi"]:
+            # Jetson nvmpi: use bitrate (no CRF support); controllable via `bitrate` kwarg.
+            video_options["b"] = bitrate
+        else:
+            # V4L2/OMX: use bitrate
+            video_options["b"] = bitrate
+    else:
+        # Software encoders
+        if crf is not None:
+            video_options["crf"] = str(crf)
+        # libx264: use faster preset for quicker encoding
+        if vcodec == "libx264":
+            video_options["preset"] = "fast" if preset is None else preset
 
-    if fast_decode:
+    if fast_decode and not is_hw_encoder:
         key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
         value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
         video_options[key] = value
@@ -528,7 +571,7 @@ def get_audio_info(video_path: Path | str) -> dict:
             return {"has_audio": False}
 
         audio_info["audio.channels"] = audio_stream.channels
-        audio_info["audio.codec"] = audio_stream.codec.canonical_name
+        audio_info["audio.codec"] = _pyav_codec_display_name(audio_stream.codec)
         # In an ideal loseless case : bit depth x sample rate x channels = bit rate.
         # In an actual compressed case, the bit rate is set according to the compression level : the lower the bit rate, the more compression is applied.
         audio_info["audio.bit_rate"] = audio_stream.bit_rate
@@ -561,7 +604,7 @@ def get_video_info(video_path: Path | str) -> dict:
 
         video_info["video.height"] = video_stream.height
         video_info["video.width"] = video_stream.width
-        video_info["video.codec"] = video_stream.codec.canonical_name
+        video_info["video.codec"] = _pyav_codec_display_name(video_stream.codec)
         video_info["video.pix_fmt"] = video_stream.pix_fmt
         video_info["video.is_depth_map"] = False
 

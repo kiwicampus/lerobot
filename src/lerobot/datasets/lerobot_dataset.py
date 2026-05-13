@@ -1527,8 +1527,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
+        vcodec = getattr(self, "vcodec", "libsvtav1")
+        encoding_kwargs = getattr(self, "encoding_kwargs", None) or {}
         encode_video_frames(
-            img_dir, temp_path, self.fps, overwrite=True, **self.encoding_kwargs
+            img_dir, temp_path, self.fps, vcodec=vcodec, overwrite=True, **encoding_kwargs
         )
         shutil.rmtree(img_dir)
         return temp_path
@@ -1624,6 +1626,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         defer_video_encoding: bool = True,
         encode_on_exit: bool = False,
         encoding_kwargs: dict | None = None,
+        vcodec: str = "libsvtav1",
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         obj = cls.__new__(cls)
@@ -1645,6 +1648,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.encode_on_exit = encode_on_exit
         obj.episodes_since_last_encoding = 0
         obj.encoding_kwargs = encoding_kwargs or {}
+        obj.vcodec = vcodec
 
         if image_writer_processes or image_writer_threads:
             obj.start_image_writer(image_writer_processes, image_writer_threads)
