@@ -41,6 +41,73 @@ from lerobot.datasets.utils import (
 )
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
 
+# LOCAL-PATCH(visibility): Phase 0 instrumentation for the rtop merge pipeline.
+# Why: a 5000-ep production run on 2026-05-13 went silent for ~46h between the
+# "Find all tasks" log line and the 48h Batch cap. We had no idea which sub-step
+# hung. This block makes aggregate_datasets() emit per-source progress + a final
+# PHASE_TIMING JSON so we can target perf work with measurement, not inspection.
+#
+# Configurable via env vars (all optional):
+#   LEROBOT_AGGREGATE_PROGRESS_EVERY  log every N source datasets (default 10)
+#   LEROBOT_AGGREGATE_PHASE_TIMING_PATH  if set, write final summary JSON here
+#
+# Forward-rebase: every line tagged with `# LOCAL-PATCH(visibility):` belongs to
+# this patch. To remove, grep that tag and delete the contiguous block.
+import json as _viz_json
+import os as _viz_os
+import sys as _viz_sys
+import time as _viz_time
+
+
+def _viz_progress_every() -> int:
+    """Read at call time so env-var changes between calls take effect."""
+    return max(1, int(_viz_os.environ.get("LEROBOT_AGGREGATE_PROGRESS_EVERY", "10")))
+
+
+def _viz_phase_timing_path() -> str | None:
+    return _viz_os.environ.get("LEROBOT_AGGREGATE_PHASE_TIMING_PATH") or None
+
+
+class _VizPhaseTimer:
+    """Accumulates wall-clock per named phase across an aggregate_datasets() run."""
+
+    def __init__(self) -> None:
+        self.totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self.run_start = _viz_time.monotonic()
+
+    def record(self, name: str, elapsed: float) -> None:
+        self.totals[name] = self.totals.get(name, 0.0) + elapsed
+        self.counts[name] = self.counts.get(name, 0) + 1
+
+    def summary(self, n_sources: int) -> dict:
+        return {
+            "wall_s_total": _viz_time.monotonic() - self.run_start,
+            "n_sources": n_sources,
+            "phases": [
+                {"phase": name, "wall_s": self.totals[name], "n_calls": self.counts[name]}
+                for name in sorted(self.totals.keys())
+            ],
+        }
+
+
+def _viz_flush() -> None:
+    try:
+        _viz_sys.stdout.flush()
+        _viz_sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _viz_time_call(timer: _VizPhaseTimer, name: str, fn, *args, **kwargs):
+    """Time a single phase call and record into the run timer."""
+    t0 = _viz_time.monotonic()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        timer.record(name, _viz_time.monotonic() - t0)
+# end LOCAL-PATCH(visibility)
+
 
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     """Validates that all dataset metadata have consistent properties.
@@ -193,6 +260,17 @@ def aggregate_datasets(
         chunk_size: Maximum number of files per chunk (defaults to DEFAULT_CHUNK_SIZE)
     """
     logging.info("Start aggregate_datasets")
+    # LOCAL-PATCH(visibility): per-run timer + announce config (read at call time)
+    _viz_timer = _VizPhaseTimer()
+    _viz_progress_every_call = _viz_progress_every()
+    _viz_phase_timing_path_call = _viz_phase_timing_path()
+    logging.info(
+        "VIZ config: progress_every=%d phase_timing_path=%s",
+        _viz_progress_every_call,
+        _viz_phase_timing_path_call or "<unset>",
+    )
+    _viz_flush()
+    # end LOCAL-PATCH(visibility)
 
     if data_files_size_in_mb is None:
         data_files_size_in_mb = DEFAULT_DATA_FILE_SIZE_IN_MB
@@ -201,6 +279,8 @@ def aggregate_datasets(
     if chunk_size is None:
         chunk_size = DEFAULT_CHUNK_SIZE
 
+    # LOCAL-PATCH(visibility): time metadata load + validate
+    _t0 = _viz_time.monotonic()
     all_metadata = (
         [LeRobotDatasetMetadata(repo_id) for repo_id in repo_ids]
         if roots is None
@@ -208,7 +288,15 @@ def aggregate_datasets(
             LeRobotDatasetMetadata(repo_id, root=root) for repo_id, root in zip(repo_ids, roots, strict=False)
         ]
     )
-    fps, robot_type, features = validate_all_metadata(all_metadata)
+    _viz_timer.record("load_source_metadata", _viz_time.monotonic() - _t0)
+    logging.info(
+        "VIZ load_source_metadata: n_sources=%d wall_s=%.2f",
+        len(all_metadata),
+        _viz_timer.totals["load_source_metadata"],
+    )
+    _viz_flush()
+    # end LOCAL-PATCH(visibility)
+    fps, robot_type, features = _viz_time_call(_viz_timer, "validate_all_metadata", validate_all_metadata, all_metadata)  # LOCAL-PATCH(visibility)
     video_keys = [key for key in features if features[key]["dtype"] == "video"]
 
     dst_meta = LeRobotDatasetMetadata.create(
@@ -224,8 +312,18 @@ def aggregate_datasets(
     )
 
     logging.info("Find all tasks")
+    # LOCAL-PATCH(visibility): time task discovery
+    _t0 = _viz_time.monotonic()
     unique_tasks = pd.concat([m.tasks for m in all_metadata]).index.unique()
     dst_meta.tasks = pd.DataFrame({"task_index": range(len(unique_tasks))}, index=unique_tasks)
+    _viz_timer.record("find_all_tasks", _viz_time.monotonic() - _t0)
+    logging.info(
+        "VIZ find_all_tasks: unique_tasks=%d wall_s=%.2f",
+        len(unique_tasks),
+        _viz_timer.totals["find_all_tasks"],
+    )
+    _viz_flush()
+    # end LOCAL-PATCH(visibility)
 
     meta_idx = {"chunk": 0, "file": 0}
     data_idx = {"chunk": 0, "file": 0}
@@ -235,17 +333,60 @@ def aggregate_datasets(
 
     dst_meta.episodes = {}
 
-    for src_meta in tqdm.tqdm(all_metadata, desc="Copy data and videos"):
-        videos_idx = aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size)
-        data_idx = aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size)
-
-        meta_idx = aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx)
+    # LOCAL-PATCH(visibility): per-source enumeration + per-call timing + periodic progress logs
+    _viz_n = len(all_metadata)
+    for _viz_idx, src_meta in enumerate(tqdm.tqdm(all_metadata, desc="Copy data and videos")):
+        _viz_src_t0 = _viz_time.monotonic()
+        videos_idx = _viz_time_call(
+            _viz_timer, "aggregate_videos",
+            aggregate_videos, src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size,
+        )
+        data_idx = _viz_time_call(
+            _viz_timer, "aggregate_data",
+            aggregate_data, src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size,
+        )
+        meta_idx = _viz_time_call(
+            _viz_timer, "aggregate_metadata",
+            aggregate_metadata, src_meta, dst_meta, meta_idx, data_idx, videos_idx,
+        )
 
         dst_meta.info["total_episodes"] += src_meta.total_episodes
         dst_meta.info["total_frames"] += src_meta.total_frames
 
-    finalize_aggregation(dst_meta, all_metadata)
+        _viz_done = _viz_idx + 1
+        if _viz_done % _viz_progress_every_call == 0 or _viz_done == _viz_n:
+            _viz_per_src = _viz_time.monotonic() - _viz_src_t0
+            _viz_running = _viz_timer.summary(_viz_done)
+            _viz_phases_str = " ".join(
+                f"{p['phase']}={p['wall_s']:.1f}s" for p in _viz_running["phases"]
+            )
+            logging.info(
+                "VIZ PROGRESS src=%d/%d last_src_wall_s=%.2f total_wall_s=%.1f | %s",
+                _viz_done, _viz_n, _viz_per_src, _viz_running["wall_s_total"], _viz_phases_str,
+            )
+            _viz_flush()
+    # end LOCAL-PATCH(visibility)
+
+    _viz_time_call(_viz_timer, "finalize_aggregation", finalize_aggregation, dst_meta, all_metadata)  # LOCAL-PATCH(visibility)
     logging.info("Aggregation complete.")
+
+    # LOCAL-PATCH(visibility): emit final PHASE_TIMING JSON (always to log, optionally to file)
+    _viz_summary = _viz_timer.summary(len(all_metadata))
+    _viz_summary["aggr_repo_id"] = aggr_repo_id
+    _viz_summary["aggr_root"] = str(aggr_root) if aggr_root is not None else None
+    _viz_summary["config"] = {
+        "data_files_size_in_mb": data_files_size_in_mb,
+        "video_files_size_in_mb": video_files_size_in_mb,
+        "chunk_size": chunk_size,
+    }
+    logging.info("PHASE_TIMING %s", _viz_json.dumps(_viz_summary))
+    if _viz_phase_timing_path_call:
+        _viz_path = Path(_viz_phase_timing_path_call)
+        _viz_path.parent.mkdir(parents=True, exist_ok=True)
+        _viz_path.write_text(_viz_json.dumps(_viz_summary, indent=2))
+        logging.info("VIZ wrote PHASE_TIMING summary to %s", _viz_path)
+    _viz_flush()
+    # end LOCAL-PATCH(visibility)
 
 
 def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size):
