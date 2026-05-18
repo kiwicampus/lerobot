@@ -402,6 +402,16 @@ class ShardExecutionError(RuntimeError):
     """Raised by execute_video_plan() when one or more shards fail."""
 
 
+def _pvp_use_planned_videos() -> bool:
+    """Read LEROBOT_AGGREGATE_VIDEO_PLAN at call time. Default False.
+    When True, aggregate_datasets() runs Stages A+B (plan + parallel
+    execute) before the per-source loop, instead of calling
+    aggregate_videos() per source. The existing online path remains
+    the fallback when this is False."""
+    raw = _viz_os.environ.get("LEROBOT_AGGREGATE_VIDEO_PLAN", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _pvp_workers_env() -> int:
     """Read LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS at call time. Default
     min(8, cpu_count()) capped at 1+."""
@@ -829,14 +839,60 @@ def aggregate_datasets(
 
     dst_meta.episodes = {}
 
+    # LOCAL-PATCH(perf-video-plan): Stage C integration — run planner + executor
+    # up front, then drive the per-source loop from per_source_view instead of
+    # calling aggregate_videos() per source. Gated by env var; default False so
+    # production stays on the online path until validated.
+    _pvp_planned = _pvp_use_planned_videos()
+    _pvp_per_source_view: dict[str, dict[str, dict]] = {}
+    _pvp_exec_summary: dict | None = None
+    if _pvp_planned:
+        logging.info(
+            "VIZ planned-videos: LEROBOT_AGGREGATE_VIDEO_PLAN=true; "
+            "running plan_video_shards + execute_video_plan up front "
+            "(workers=%d, timeout_s=%.0f)",
+            _pvp_workers_env(), _pvp_timeout_env(),
+        )
+        _viz_flush()
+        _pvp_plan, _pvp_per_source_view = _viz_time_call(
+            _viz_timer, "plan_video_shards",
+            plan_video_shards, all_metadata, dst_meta.root, video_keys,
+            video_files_size_in_mb, chunk_size,
+        )
+        _pvp_n_shards = sum(len(s) for s in _pvp_plan.values())
+        logging.info(
+            "VIZ planned-videos: planned %d shards across %d cameras (took %.2fs)",
+            _pvp_n_shards, len(video_keys),
+            _viz_timer.totals.get("plan_video_shards", 0.0),
+        )
+        _viz_flush()
+        _pvp_exec_summary = _viz_time_call(
+            _viz_timer, "execute_video_plan",
+            execute_video_plan, _pvp_plan, _pvp_workers_env(),
+        )
+        logging.info(
+            "VIZ planned-videos: executed %d/%d shards (took %.2fs, "
+            "%d bytes written, methods=%s)",
+            _pvp_exec_summary["n_ok"], _pvp_exec_summary["n_shards"],
+            _viz_timer.totals.get("execute_video_plan", 0.0),
+            _pvp_exec_summary["bytes_written_total"],
+            _pvp_exec_summary["method_counts"],
+        )
+        _viz_flush()
+    # end LOCAL-PATCH(perf-video-plan)
+
     # LOCAL-PATCH(visibility): per-source enumeration + per-call timing + periodic progress logs
     _viz_n = len(all_metadata)
     for _viz_idx, src_meta in enumerate(tqdm.tqdm(all_metadata, desc="Copy data and videos")):
         _viz_src_t0 = _viz_time.monotonic()
-        videos_idx = _viz_time_call(
-            _viz_timer, "aggregate_videos",
-            aggregate_videos, src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size,
-        )
+        if _pvp_planned:  # LOCAL-PATCH(perf-video-plan)
+            # Video work already done up front; just fetch this source's view.
+            videos_idx = _pvp_per_source_view[src_meta.repo_id]
+        else:
+            videos_idx = _viz_time_call(
+                _viz_timer, "aggregate_videos",
+                aggregate_videos, src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size,
+            )
         data_idx = _viz_time_call(
             _viz_timer, "aggregate_data",
             aggregate_data, src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size,
@@ -886,6 +942,11 @@ def aggregate_datasets(
     )
     logging.info("VIZ videos_inner: %s", _viz_inner_line)
     # end LOCAL-PATCH(visibility-inner)
+    # LOCAL-PATCH(perf-video-plan): attach executor summary when planned path ran
+    _viz_summary["planned_videos_enabled"] = _pvp_planned
+    if _pvp_planned and _pvp_exec_summary is not None:
+        _viz_summary["execute_video_plan"] = _pvp_exec_summary
+    # end LOCAL-PATCH(perf-video-plan)
     logging.info("PHASE_TIMING %s", _viz_json.dumps(_viz_summary))
     if _viz_phase_timing_path_call:
         _viz_path = Path(_viz_phase_timing_path_call)
