@@ -135,6 +135,255 @@ def _viz_inner_record(name: str, elapsed: float, bytes_in: int = 0) -> None:
 # end LOCAL-PATCH(visibility-inner)
 
 
+# LOCAL-PATCH(perf-video-plan): Phase 3 / Patch D — plan-then-execute video
+# aggregation (Stage A: planner). See
+# ml/data_pipeline/lerobot_merge/docs/patch_d_design.html for the full spec.
+#
+# Why: the Phase 0.5 inner profile showed concatenate_video_files() is 98.5%
+# of aggregate_videos wall-clock (66.7s/190 calls/36.1 GB read on 40 ep). The
+# online code re-reads the growing destination on every concat, so cumulative
+# I/O scales O(M^2) with sources-per-shard. The planner instead packs sources
+# into ShardPlans up front; Stage B then runs one multi-source ffmpeg concat
+# per shard (each source read exactly once), parallelised across shards.
+#
+# This block adds:
+#   - SourceEntry, ShardPlan dataclasses
+#   - IncompatibleSourceError
+#   - plan_video_shards()  — computes the full plan + per-source videos_idx view
+#
+# Stage B (executor) and Stage C (integration into aggregate_datasets) come in
+# follow-up patches. This block is callable + testable on its own; it does no
+# I/O beyond stat() and get_video_duration_in_s() probes.
+from dataclasses import dataclass as _pvp_dataclass, field as _pvp_field
+
+
+class IncompatibleSourceError(ValueError):
+    """Raised by plan_video_shards() when sources for a camera disagree on
+    codec / pix_fmt / resolution / fps. Aborts the merge before any I/O."""
+
+
+@_pvp_dataclass(frozen=True)
+class SourceEntry:
+    src_path: Path
+    src_chunk: int
+    src_file: int
+    src_size_bytes: int
+    src_duration_s: float
+    offset_in_dst_s: float
+
+
+@_pvp_dataclass
+class ShardPlan:
+    key: str
+    dst_chunk: int
+    dst_file: int
+    dst_path: Path
+    sources: list = _pvp_field(default_factory=list)  # list[SourceEntry]
+
+    @property
+    def total_size_bytes(self) -> int:
+        return sum(s.src_size_bytes for s in self.sources)
+
+    @property
+    def total_duration_s(self) -> float:
+        return sum(s.src_duration_s for s in self.sources)
+
+
+def _pvp_unique_src_pairs(src_meta, key) -> list[tuple[int, int]]:
+    """Sorted unique (chunk, file) pairs for `key` in this source's episodes
+    metadata. Same logic the online aggregate_videos uses."""
+    return sorted({
+        (chunk, file)
+        for chunk, file in zip(
+            src_meta.episodes[f"videos/{key}/chunk_index"],
+            src_meta.episodes[f"videos/{key}/file_index"],
+            strict=False,
+        )
+    })
+
+
+def _pvp_validate_camera_consistency(all_metadata, key: str) -> None:
+    """All source datasets must agree on codec / pix_fmt / resolution / fps
+    for the given camera, otherwise ffmpeg -c copy concat will fail at
+    runtime. We catch this up-front so the merge aborts cleanly."""
+    if not all_metadata:
+        return
+    ref_feat = all_metadata[0].features.get(key)
+    if ref_feat is None:
+        raise IncompatibleSourceError(
+            f"camera '{key}' missing from first source's features"
+        )
+    ref_info = ref_feat.get("info", {}) or {}
+    ref_shape = ref_feat.get("shape")
+    keys_to_check = ("video.codec", "video.pix_fmt", "video.fps",
+                     "video.height", "video.width")
+    for src_meta in all_metadata[1:]:
+        f = src_meta.features.get(key)
+        if f is None:
+            raise IncompatibleSourceError(
+                f"camera '{key}' missing from source {src_meta.repo_id}"
+            )
+        info = f.get("info", {}) or {}
+        if f.get("shape") != ref_shape:
+            raise IncompatibleSourceError(
+                f"camera '{key}' shape mismatch: ref={ref_shape} "
+                f"vs {src_meta.repo_id}={f.get('shape')}"
+            )
+        for k in keys_to_check:
+            if info.get(k) != ref_info.get(k):
+                raise IncompatibleSourceError(
+                    f"camera '{key}' {k} mismatch: ref={ref_info.get(k)} "
+                    f"vs {src_meta.repo_id}={info.get(k)}"
+                )
+
+
+def plan_video_shards(
+    all_metadata,
+    aggr_root: Path,
+    video_keys: list[str],
+    video_files_size_in_mb: float,
+    chunk_size: int,
+) -> tuple[dict, dict]:
+    """Compute the full destination-shard plan for every camera + a per-source
+    videos_idx view that aggregate_metadata() can consume without re-touching
+    file state.
+
+    Returns:
+      plan:            {camera_key: [ShardPlan, ...]} in shard order
+      per_source_view: {src_repo_id: {camera_key: videos_idx_dict}}
+
+    `per_source_view[r][k]` matches the shape `aggregate_videos()` produces
+    today, with one twist: `episode_duration` is pre-set to 0 so the existing
+    `latest_duration += episode_duration` mutation in `aggregate_metadata()`
+    becomes a no-op. The cumulative duration before this source's first src
+    is recorded as `latest_duration` directly.
+    """
+    size_cap_bytes = int(video_files_size_in_mb * 1024 * 1024)
+    plan: dict[str, list[ShardPlan]] = {}
+    # per_source_view: src_repo_id -> {key: {chunk, file, latest_duration,
+    # episode_duration, src_to_offset}}
+    per_source_view: dict[str, dict[str, dict]] = {}
+
+    # We need to enumerate sources in the same order aggregate_datasets() does
+    # so the resulting layout matches one-for-one. Source order is the order
+    # of `all_metadata`; within a source, the (chunk, file) pairs are sorted.
+    for src_meta in all_metadata:
+        per_source_view.setdefault(src_meta.repo_id, {})
+
+    for key in video_keys:
+        _pvp_validate_camera_consistency(all_metadata, key)
+        shards: list[ShardPlan] = []
+        chunk_idx = 0
+        file_idx = 0
+        # Running estimates of the current (still-open) destination shard.
+        dst_size_estimate_bytes = 0
+        dst_duration_estimate_s = 0.0
+        current_shard: ShardPlan | None = None
+
+        for src_meta in all_metadata:
+            # Per-source view starts fresh; will be filled below.
+            src_view = {
+                "chunk": chunk_idx,
+                "file": file_idx,
+                "latest_duration": dst_duration_estimate_s
+                if current_shard is not None and current_shard.sources
+                else 0.0,
+                "episode_duration": 0.0,           # see "contract trick" in design doc
+                "src_to_offset": {},
+            }
+            # Track what we record into the view per (src_chunk, src_file).
+            last_dst_chunk = chunk_idx
+            last_dst_file = file_idx
+
+            for src_chunk, src_file in _pvp_unique_src_pairs(src_meta, key):
+                src_path = src_meta.root / DEFAULT_VIDEO_PATH.format(
+                    video_key=key, chunk_index=src_chunk, file_index=src_file,
+                )
+                if not src_path.is_file():
+                    raise FileNotFoundError(
+                        f"missing source mp4: {src_path} "
+                        f"(camera={key}, src_meta={src_meta.repo_id})"
+                    )
+                src_size_bytes = src_path.stat().st_size
+                src_duration_s = float(get_video_duration_in_s(src_path))
+
+                # Decide: first-in-shard, rotate, or append.
+                if current_shard is None or not current_shard.sources:
+                    # First src ever for this camera (or empty shard after rotate).
+                    if current_shard is None:
+                        current_shard = ShardPlan(
+                            key=key,
+                            dst_chunk=chunk_idx,
+                            dst_file=file_idx,
+                            dst_path=aggr_root / DEFAULT_VIDEO_PATH.format(
+                                video_key=key, chunk_index=chunk_idx, file_index=file_idx,
+                            ),
+                        )
+                    offset_in_dst_s = 0.0
+                    dst_size_estimate_bytes = src_size_bytes
+                    dst_duration_estimate_s = src_duration_s
+                elif dst_size_estimate_bytes + src_size_bytes >= size_cap_bytes:
+                    # Rotate: close current shard, start a new one.
+                    shards.append(current_shard)
+                    chunk_idx, file_idx = update_chunk_file_indices(
+                        chunk_idx, file_idx, chunk_size
+                    )
+                    current_shard = ShardPlan(
+                        key=key,
+                        dst_chunk=chunk_idx,
+                        dst_file=file_idx,
+                        dst_path=aggr_root / DEFAULT_VIDEO_PATH.format(
+                            video_key=key, chunk_index=chunk_idx, file_index=file_idx,
+                        ),
+                    )
+                    offset_in_dst_s = 0.0
+                    dst_size_estimate_bytes = src_size_bytes
+                    dst_duration_estimate_s = src_duration_s
+                else:
+                    # Append to the current open shard.
+                    offset_in_dst_s = dst_duration_estimate_s
+                    dst_size_estimate_bytes += src_size_bytes
+                    dst_duration_estimate_s += src_duration_s
+
+                current_shard.sources.append(SourceEntry(
+                    src_path=src_path,
+                    src_chunk=src_chunk,
+                    src_file=src_file,
+                    src_size_bytes=src_size_bytes,
+                    src_duration_s=src_duration_s,
+                    offset_in_dst_s=offset_in_dst_s,
+                ))
+
+                # Record per-source-file destination + offset for update_meta_data().
+                src_view["src_to_offset"][(src_chunk, src_file)] = offset_in_dst_s
+                last_dst_chunk = current_shard.dst_chunk
+                last_dst_file = current_shard.dst_file
+
+            # After all src files for this source, record where they ended up.
+            src_view["chunk"] = last_dst_chunk
+            src_view["file"] = last_dst_file
+            per_source_view[src_meta.repo_id][key] = src_view
+
+        # Flush the still-open shard at end-of-camera.
+        if current_shard is not None and current_shard.sources:
+            shards.append(current_shard)
+        plan[key] = shards
+
+    # Sanity: every (key, dst_chunk, dst_file) is unique across the plan.
+    seen: set[tuple[str, int, int]] = set()
+    for key, shards in plan.items():
+        for s in shards:
+            tup = (key, s.dst_chunk, s.dst_file)
+            if tup in seen:
+                raise AssertionError(
+                    f"duplicate shard key in plan: {tup} — planner bug"
+                )
+            seen.add(tup)
+
+    return plan, per_source_view
+# end LOCAL-PATCH(perf-video-plan)
+
+
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     """Validates that all dataset metadata have consistent properties.
 
