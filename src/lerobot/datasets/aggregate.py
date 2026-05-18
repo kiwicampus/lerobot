@@ -154,7 +154,10 @@ def _viz_inner_record(name: str, elapsed: float, bytes_in: int = 0) -> None:
 # Stage B (executor) and Stage C (integration into aggregate_datasets) come in
 # follow-up patches. This block is callable + testable on its own; it does no
 # I/O beyond stat() and get_video_duration_in_s() probes.
+from concurrent import futures as _pvp_pool
 from dataclasses import dataclass as _pvp_dataclass, field as _pvp_field
+import subprocess as _pvp_subprocess
+import tempfile as _pvp_tempfile
 
 
 class IncompatibleSourceError(ValueError):
@@ -381,6 +384,217 @@ def plan_video_shards(
             seen.add(tup)
 
     return plan, per_source_view
+
+
+# ─────── Stage B: executor (runs each ShardPlan to disk) ───────
+
+
+@_pvp_dataclass(frozen=True)
+class ShardResult:
+    ok: bool
+    detail: str = ""
+    wall_s: float = 0.0
+    bytes_written: int = 0
+    method: str = ""  # "copy" or "ffmpeg"
+
+
+class ShardExecutionError(RuntimeError):
+    """Raised by execute_video_plan() when one or more shards fail."""
+
+
+def _pvp_workers_env() -> int:
+    """Read LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS at call time. Default
+    min(8, cpu_count()) capped at 1+."""
+    raw = _viz_os.environ.get("LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return min(8, _viz_os.cpu_count() or 4)
+
+
+def _pvp_timeout_env() -> float:
+    """Read LEROBOT_AGGREGATE_VIDEO_PLAN_TIMEOUT_S at call time. Default 1200."""
+    raw = _viz_os.environ.get("LEROBOT_AGGREGATE_VIDEO_PLAN_TIMEOUT_S")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return 1200.0
+
+
+def _execute_shard(shard: ShardPlan) -> ShardResult:
+    """Materialize one ShardPlan to disk.
+
+    Single-source shards use shutil.copy (byte-identical, no re-mux).
+    Multi-source shards use one ffmpeg subprocess with `-f concat -c copy`.
+    Output writes are atomic: ffmpeg writes to a sibling temp file which
+    is moved to the final path on success; failures clean up the temp.
+
+    This function is pickled to ProcessPoolExecutor workers, so all of its
+    imports come from the module-level prologue (subprocess, tempfile via
+    _pvp_subprocess / _pvp_tempfile). The function is intentionally pure
+    of any non-picklable closure state.
+    """
+    t0 = _viz_time.monotonic()
+
+    if not shard.sources:
+        return ShardResult(ok=False, detail="empty source list", wall_s=0.0)
+
+    shard.dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Single-source fast path: byte-identical with shutil.copy
+    if len(shard.sources) == 1:
+        try:
+            shutil.copy(str(shard.sources[0].src_path), str(shard.dst_path))
+        except Exception as exc:  # noqa: BLE001
+            return ShardResult(
+                ok=False, detail=f"copy failed: {exc!r}",
+                wall_s=_viz_time.monotonic() - t0, method="copy",
+            )
+        return ShardResult(
+            ok=True, method="copy",
+            wall_s=_viz_time.monotonic() - t0,
+            bytes_written=shard.dst_path.stat().st_size,
+        )
+
+    # Multi-source: ffmpeg concat demuxer with stream-copy
+    list_path = None
+    tmp_dst = shard.dst_path.with_suffix(".mp4.tmp")
+    try:
+        with _pvp_tempfile.NamedTemporaryFile(
+            "w", suffix=".ffconcat", delete=False,
+            dir=str(shard.dst_path.parent),
+        ) as f:
+            f.write("ffconcat version 1.0\n")
+            for src in shard.sources:
+                f.write(f"file '{src.src_path.resolve()}'\n")
+            list_path = f.name
+
+        proc = _pvp_subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
+                "-movflags", "faststart",
+                "-f", "mp4",     # force muxer; tmp suffix is .mp4.tmp
+                str(tmp_dst),
+            ],
+            capture_output=True, text=True,
+            timeout=_pvp_timeout_env(),
+        )
+        if proc.returncode != 0:
+            return ShardResult(
+                ok=False,
+                detail=f"ffmpeg rc={proc.returncode}: {proc.stderr[-2000:]}",
+                wall_s=_viz_time.monotonic() - t0, method="ffmpeg",
+            )
+        shutil.move(str(tmp_dst), str(shard.dst_path))
+        return ShardResult(
+            ok=True, method="ffmpeg",
+            wall_s=_viz_time.monotonic() - t0,
+            bytes_written=shard.dst_path.stat().st_size,
+        )
+    except _pvp_subprocess.TimeoutExpired:
+        return ShardResult(
+            ok=False,
+            detail=f"ffmpeg timed out after {_pvp_timeout_env()}s",
+            wall_s=_viz_time.monotonic() - t0, method="ffmpeg",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ShardResult(
+            ok=False, detail=f"ffmpeg invocation failed: {exc!r}",
+            wall_s=_viz_time.monotonic() - t0, method="ffmpeg",
+        )
+    finally:
+        if list_path is not None:
+            Path(list_path).unlink(missing_ok=True)
+        if tmp_dst.exists():
+            tmp_dst.unlink(missing_ok=True)
+
+
+def execute_video_plan(plan: dict, max_workers: int | None = None) -> dict:
+    """Run every ShardPlan in `plan` to produce the output mp4s.
+
+    Args:
+      plan:        {camera_key: [ShardPlan, ...]} from plan_video_shards()
+      max_workers: if None, read LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS env
+                   (default min(8, cpu_count())). If 1, runs sequentially
+                   in-process (useful for tests and deterministic logs).
+
+    Returns a summary dict (per-shard timings, byte counts, method counts).
+    Raises ShardExecutionError on any failure (all other shards complete
+    first; partial outputs are NOT cleaned up because the per-shard
+    tmp-then-rename pattern ensures only successful outputs are present).
+    """
+    tasks: list[ShardPlan] = [s for shards in plan.values() for s in shards]
+    if not tasks:
+        return {
+            "n_shards": 0, "n_ok": 0, "wall_s_total": 0.0,
+            "bytes_written_total": 0, "method_counts": {},
+            "max_workers": 0, "per_shard": [],
+        }
+
+    workers = max_workers if max_workers is not None else _pvp_workers_env()
+    workers = min(workers, len(tasks))  # don't over-allocate
+
+    t0 = _viz_time.monotonic()
+    results: list[tuple[ShardPlan, ShardResult]] = []
+
+    if workers <= 1:
+        # Sequential path; preferred for tests and small plans.
+        for s in tasks:
+            results.append((s, _execute_shard(s)))
+    else:
+        # Parallel path; one ffmpeg subprocess per shard, up to `workers`
+        # concurrently. Order of completion is non-deterministic.
+        with _pvp_pool.ProcessPoolExecutor(max_workers=workers) as pool:
+            future_to_shard = {pool.submit(_execute_shard, s): s for s in tasks}
+            for fut in _pvp_pool.as_completed(future_to_shard):
+                s = future_to_shard[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    r = ShardResult(ok=False, detail=f"worker exception: {exc!r}")
+                results.append((s, r))
+
+    method_counts: dict[str, int] = {}
+    for _, r in results:
+        if r.method:
+            method_counts[r.method] = method_counts.get(r.method, 0) + 1
+
+    summary = {
+        "n_shards": len(results),
+        "n_ok": sum(1 for _, r in results if r.ok),
+        "wall_s_total": _viz_time.monotonic() - t0,
+        "bytes_written_total": sum(r.bytes_written for _, r in results if r.ok),
+        "method_counts": method_counts,
+        "max_workers": workers,
+        "per_shard": [
+            {
+                "key": s.key, "dst_chunk": s.dst_chunk, "dst_file": s.dst_file,
+                "dst_path": str(s.dst_path), "n_sources": len(s.sources),
+                "ok": r.ok, "method": r.method, "wall_s": r.wall_s,
+                "bytes_written": r.bytes_written, "detail": r.detail,
+            }
+            for s, r in results
+        ],
+    }
+
+    failures = [(s, r) for s, r in results if not r.ok]
+    if failures:
+        head = "\n".join(
+            f"  {s.key} dst=({s.dst_chunk},{s.dst_file}) n_src={len(s.sources)}: {r.detail}"
+            for s, r in failures[:5]
+        )
+        raise ShardExecutionError(
+            f"{len(failures)}/{len(results)} shards failed:\n{head}"
+        )
+
+    return summary
 # end LOCAL-PATCH(perf-video-plan)
 
 
