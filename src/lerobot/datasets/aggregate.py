@@ -109,6 +109,32 @@ def _viz_time_call(timer: _VizPhaseTimer, name: str, fn, *args, **kwargs):
 # end LOCAL-PATCH(visibility)
 
 
+# LOCAL-PATCH(visibility-inner): per-branch counters for aggregate_videos.
+# Phase 0 outer profiling showed aggregate_videos at ~93% of wall-clock. To
+# target Phase 3 work correctly we need to know which branch inside it
+# dominates: shutil.copy on first-in-shard, shutil.copy on size-rotation,
+# or ffmpeg concat on append-into-existing. PyAV duration probe is also
+# counted here since it fires on every iteration.
+#
+# Module-level dict, reset at the start of each aggregate_datasets() run,
+# populated by aggregate_videos(), merged into the PHASE_TIMING summary.
+_VIZ_INNER: dict = {}
+
+
+def _viz_inner_reset() -> None:
+    _VIZ_INNER.clear()
+    for k in ("videos.copy_first", "videos.copy_rotate", "videos.concat", "videos.probe"):
+        _VIZ_INNER[k] = {"wall_s": 0.0, "n_calls": 0, "bytes_in": 0}
+
+
+def _viz_inner_record(name: str, elapsed: float, bytes_in: int = 0) -> None:
+    e = _VIZ_INNER.setdefault(name, {"wall_s": 0.0, "n_calls": 0, "bytes_in": 0})
+    e["wall_s"] += elapsed
+    e["n_calls"] += 1
+    e["bytes_in"] += bytes_in
+# end LOCAL-PATCH(visibility-inner)
+
+
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     """Validates that all dataset metadata have consistent properties.
 
@@ -268,6 +294,7 @@ def aggregate_datasets(
     logging.info("Start aggregate_datasets")
     # LOCAL-PATCH(visibility): per-run timer + announce config (read at call time)
     _viz_timer = _VizPhaseTimer()
+    _viz_inner_reset()  # LOCAL-PATCH(visibility-inner): reset per-run inner accumulators
     _viz_progress_every_call = _viz_progress_every()
     _viz_phase_timing_path_call = _viz_phase_timing_path()
     logging.info(
@@ -385,6 +412,17 @@ def aggregate_datasets(
         "video_files_size_in_mb": video_files_size_in_mb,
         "chunk_size": chunk_size,
     }
+    # LOCAL-PATCH(visibility-inner): attach per-branch breakdown for aggregate_videos
+    _viz_summary["videos_inner"] = {
+        name: dict(stats) for name, stats in _VIZ_INNER.items()
+    }
+    # Log a one-liner that's easy to grep alongside VIZ PROGRESS
+    _viz_inner_line = " ".join(
+        f"{name.split('.', 1)[1]}={s['wall_s']:.1f}s/{s['n_calls']}calls"
+        for name, s in _VIZ_INNER.items()
+    )
+    logging.info("VIZ videos_inner: %s", _viz_inner_line)
+    # end LOCAL-PATCH(visibility-inner)
     logging.info("PHASE_TIMING %s", _viz_json.dumps(_viz_summary))
     if _viz_phase_timing_path_call:
         _viz_path = Path(_viz_phase_timing_path_call)
@@ -444,13 +482,22 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                 file_index=file_idx,
             )
 
+            # LOCAL-PATCH(visibility-inner): time the PyAV duration probe
+            _viz_t0 = _viz_time.monotonic()
             src_duration = get_video_duration_in_s(src_path)
+            _viz_inner_record("videos.probe", _viz_time.monotonic() - _viz_t0)
+            # end LOCAL-PATCH(visibility-inner)
 
             if not dst_path.exists():
                 # Store offset before incrementing
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = current_offset
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
+                # LOCAL-PATCH(visibility-inner): time first-in-shard copy
+                _viz_t0 = _viz_time.monotonic()
+                _viz_src_bytes = src_path.stat().st_size
                 shutil.copy(str(src_path), str(dst_path))
+                _viz_inner_record("videos.copy_first", _viz_time.monotonic() - _viz_t0, _viz_src_bytes)
+                # end LOCAL-PATCH(visibility-inner)
                 videos_idx[key]["episode_duration"] += src_duration
                 current_offset += src_duration
                 continue
@@ -470,16 +517,26 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                     file_index=file_idx,
                 )
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
+                # LOCAL-PATCH(visibility-inner): time size-rotation copy
+                _viz_t0 = _viz_time.monotonic()
+                _viz_src_bytes = src_path.stat().st_size
                 shutil.copy(str(src_path), str(dst_path))
+                _viz_inner_record("videos.copy_rotate", _viz_time.monotonic() - _viz_t0, _viz_src_bytes)
+                # end LOCAL-PATCH(visibility-inner)
                 # Reset offset for next file
                 current_offset = src_duration
             else:
                 # Append to existing video file - use current accumulated offset
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = current_offset
+                # LOCAL-PATCH(visibility-inner): time ffmpeg concat (bytes_in = src + existing dst, both are read)
+                _viz_t0 = _viz_time.monotonic()
+                _viz_bytes_in = src_path.stat().st_size + dst_path.stat().st_size
                 concatenate_video_files(
                     [dst_path, src_path],
                     dst_path,
                 )
+                _viz_inner_record("videos.concat", _viz_time.monotonic() - _viz_t0, _viz_bytes_in)
+                # end LOCAL-PATCH(visibility-inner)
                 current_offset += src_duration
 
             videos_idx[key]["episode_duration"] += src_duration
