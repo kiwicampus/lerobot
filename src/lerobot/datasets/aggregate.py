@@ -768,6 +768,7 @@ def aggregate_datasets(
     # LOCAL-PATCH(visibility): per-run timer + announce config (read at call time)
     _viz_timer = _VizPhaseTimer()
     _viz_inner_reset()  # LOCAL-PATCH(visibility-inner): reset per-run inner accumulators
+    _parq_reset()  # LOCAL-PATCH(perf-parquet-stream): defensively close any leaked writers
     _viz_progress_every_call = _viz_progress_every()
     _viz_phase_timing_path_call = _viz_phase_timing_path()
     logging.info(
@@ -920,6 +921,10 @@ def aggregate_datasets(
     # end LOCAL-PATCH(visibility)
 
     _viz_time_call(_viz_timer, "finalize_aggregation", finalize_aggregation, dst_meta, all_metadata)  # LOCAL-PATCH(visibility)
+    # LOCAL-PATCH(perf-parquet-stream): close all open writers so parquet footers
+    # are written before the merger exits and pi-data-sharing validate runs.
+    _viz_time_call(_viz_timer, "parq_finalize_all", _parq_finalize_all)
+    # end LOCAL-PATCH(perf-parquet-stream)
     logging.info("Aggregation complete.")
 
     # LOCAL-PATCH(visibility): emit final PHASE_TIMING JSON (always to log, optionally to file)
@@ -947,6 +952,9 @@ def aggregate_datasets(
     if _pvp_planned and _pvp_exec_summary is not None:
         _viz_summary["execute_video_plan"] = _pvp_exec_summary
     # end LOCAL-PATCH(perf-video-plan)
+    # LOCAL-PATCH(perf-parquet-stream): record whether the streaming path was active
+    _viz_summary["parquet_stream_enabled"] = _parq_stream_enabled()
+    # end LOCAL-PATCH(perf-parquet-stream)
     logging.info("PHASE_TIMING %s", _viz_json.dumps(_viz_summary))
     if _viz_phase_timing_path_call:
         _viz_path = Path(_viz_phase_timing_path_call)
@@ -1170,6 +1178,135 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     return meta_idx
 
 
+# LOCAL-PATCH(perf-parquet-stream): Patch A — streaming parquet writer.
+# Replaces append_or_create_parquet_file's O(N^2) read-modify-write of the
+# destination parquet (pd.read_parquet -> pd.concat -> to_parquet on every
+# source) with a pyarrow.ParquetWriter that's opened once per destination
+# file and accumulates row groups as sources arrive. Total cost drops from
+# O(N^2) to O(N) in source count.
+#
+# Gated by LEROBOT_AGGREGATE_PARQUET_STREAM env var; default off so the
+# online RMW path remains the fallback. Open writers are tracked in a
+# module-level dict keyed by destination Path; _parq_reset() is called at
+# the top of aggregate_datasets() to defend against leaked state from a
+# prior call, and _parq_finalize_all() is called at the end so every
+# writer's footer is properly written.
+#
+# 500-ep cloud measurement (commit c12233bd4 Stage C only) showed
+# aggregate_data at 202s with O(N^2) per-100-source growth (14.9s ->
+# 26.0s -> 42.9s -> 61.0s). Linear extrapolation to 5000 ep is ~5.9h,
+# uncomfortably close to the 4h Batch cap. Patch A projects ~30-40 min
+# linear for 5000 ep, comfortably within cap with margin for >10k ep.
+import pyarrow as _parq_pa
+import pyarrow.parquet as _parq_papq
+
+
+_PARQ_WRITERS: dict = {}
+
+
+def _parq_stream_enabled() -> bool:
+    """Read LEROBOT_AGGREGATE_PARQUET_STREAM at call time. Default False."""
+    raw = _viz_os.environ.get("LEROBOT_AGGREGATE_PARQUET_STREAM", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parq_reset() -> None:
+    """Close any leaked writers from a previous call (defensive)."""
+    for entry in list(_PARQ_WRITERS.values()):
+        try:
+            entry["writer"].close()
+        except Exception:
+            pass
+    _PARQ_WRITERS.clear()
+
+
+def _parq_finalize_all() -> None:
+    """Close every open writer. Must be called at end of aggregate_datasets()
+    so each destination parquet gets a valid footer."""
+    for entry in _PARQ_WRITERS.values():
+        entry["writer"].close()
+    _PARQ_WRITERS.clear()
+
+
+def _append_or_create_parquet_file_streaming(
+    df: pd.DataFrame,
+    src_path: Path,
+    idx: dict[str, int],
+    max_mb: float,
+    chunk_size: int,
+    default_path: str,
+    aggr_root: Path,
+) -> dict[str, int]:
+    """Streaming variant of append_or_create_parquet_file().
+
+    Maintains an open pyarrow.ParquetWriter per destination path in
+    _PARQ_WRITERS. Each call writes one row group (the source's rows)
+    and updates a cumulative size estimate. When the estimate would
+    exceed max_mb, closes the current writer and opens a new one at
+    the rotated (chunk, file) index.
+    """
+    table = _parq_pa.Table.from_pandas(df, preserve_index=False)
+    src_size_mb = get_parquet_file_size_in_mb(src_path)
+
+    dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+
+    entry = _PARQ_WRITERS.get(dst_path)
+    if entry is None:
+        # First write to this destination.
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = _parq_papq.ParquetWriter(str(dst_path), table.schema)
+        writer.write_table(table)
+        _PARQ_WRITERS[dst_path] = {
+            "writer": writer,
+            "schema": table.schema,
+            "size_estimate_mb": src_size_mb,
+        }
+        return idx
+
+    if entry["size_estimate_mb"] + src_size_mb >= max_mb:
+        # Rotate: close current writer, open a new one at the next index.
+        entry["writer"].close()
+        del _PARQ_WRITERS[dst_path]
+        idx["chunk"], idx["file"] = update_chunk_file_indices(
+            idx["chunk"], idx["file"], chunk_size
+        )
+        new_path = aggr_root / default_path.format(
+            chunk_index=idx["chunk"], file_index=idx["file"]
+        )
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = _parq_papq.ParquetWriter(str(new_path), table.schema)
+        writer.write_table(table)
+        _PARQ_WRITERS[new_path] = {
+            "writer": writer,
+            "schema": table.schema,
+            "size_estimate_mb": src_size_mb,
+        }
+        return idx
+
+    # Append to the open writer for this destination. Schemas can drift
+    # across sources because `update_meta_data` mutates `from_timestamp` /
+    # `to_timestamp` via `df.at[i, c] += offset`, which pandas treats as
+    # in-place truncation when the column dtype is integer (or vice versa
+    # when the value falls cleanly on an int). The online pd.concat path
+    # silently coerces; we replicate the same behavior via pyarrow.cast
+    # with safe=False so the merger doesn't crash on naturally-mixed-type
+    # source data. Genuinely incompatible types (e.g., string vs int) will
+    # still raise from cast().
+    if table.schema != entry["schema"]:
+        try:
+            table = table.cast(entry["schema"], safe=False)
+        except (_parq_pa.ArrowInvalid, _parq_pa.ArrowNotImplementedError,
+                _parq_pa.ArrowTypeError) as exc:
+            raise ValueError(
+                f"streaming parquet append: schema mismatch for {dst_path} "
+                f"and cast to writer schema failed: {exc}"
+            ) from exc
+    entry["writer"].write_table(table)
+    entry["size_estimate_mb"] += src_size_mb
+    return idx
+# end LOCAL-PATCH(perf-parquet-stream)
+
+
 def append_or_create_parquet_file(
     df: pd.DataFrame,
     src_path: Path,
@@ -1198,6 +1335,16 @@ def append_or_create_parquet_file(
     Returns:
         dict: Updated index dictionary with current chunk and file indices.
     """
+    # LOCAL-PATCH(perf-parquet-stream): dispatch to the streaming writer when
+    # enabled. The image-bearing path uses to_parquet_with_hf_images which is
+    # not supported by ParquetWriter; fall through to the online path for
+    # contains_images=True so image datasets continue to work.
+    if _parq_stream_enabled() and not contains_images:
+        return _append_or_create_parquet_file_streaming(
+            df, src_path, idx, max_mb, chunk_size, default_path, aggr_root,
+        )
+    # end LOCAL-PATCH(perf-parquet-stream)
+
     dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
 
     if not dst_path.exists():
