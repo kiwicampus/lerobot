@@ -373,8 +373,7 @@ def encode_video_frames(
         if input_list:
             found_suffix = suffix
             break
-    print(f'[DEBUG] Found {len(input_list)} frames (.{found_suffix}) in {imgs_dir.name} -> encoding to {Path(video_path).name}')
-
+    
     # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
@@ -431,7 +430,6 @@ def encode_video_frames(
 
         # Loop through input frames and encode them
         for frame_idx, input_data in enumerate(input_list):
-            print(f'[DEBUG] Encoding frame {frame_idx} / {len(input_list) - 1}: {Path(input_data).name} -> {Path(video_path).name}')
             with Image.open(input_data) as input_image:
                 input_image = input_image.convert("RGB")
                 if target_size is not None:

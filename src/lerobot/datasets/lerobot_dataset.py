@@ -38,7 +38,6 @@ from lerobot.datasets.utils import (
     DEFAULT_EPISODES_PATH,
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
-    DEFAULT_IMAGE_PATH_JPG,
     INFO_PATH,
     _validate_feature_names,
     check_delta_timestamps,
@@ -1078,8 +1077,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         fpath = f"images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}{ext}"
         return self.root / fpath
 
-    def _get_image_file_path_jpg(self, episode_index: int, image_key: str, frame_index: int) -> Path:
-        return self._get_image_file_path_ext(episode_index, image_key, frame_index, ".jpg")
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
