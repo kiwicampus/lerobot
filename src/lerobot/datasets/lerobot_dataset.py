@@ -67,6 +67,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import (
+    SUPPORTED_FRAME_EXTENSIONS,
     VideoFrame,
     concatenate_video_files,
     decode_video_frames,
@@ -78,6 +79,30 @@ from lerobot.datasets.video_utils import (
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
+
+# (magic_bytes, file_extension, byte_offset) — offset is where magic appears in the file
+SUPPORTED_IMAGE_FORMATS: dict[str, tuple[bytes, str, int]] = {
+    "jpeg": (b"\xff\xd8\xff", ".jpg", 0),
+    "png":  (b"\x89PNG",      ".png", 0),
+    "webp": (b"RIFF",         ".webp", 0),  # also requires data[8:12] == b"WEBP"
+    "avif": (b"ftypavif",     ".avif", 4),
+}
+
+
+def resolve_image_format(data: bytes, explicit_format: str | None = None) -> tuple[str, str]:
+    """Return (format_name, file_extension). Raises ValueError for unknown formats."""
+    if explicit_format is not None:
+        if explicit_format not in SUPPORTED_IMAGE_FORMATS:
+            raise ValueError(
+                f"Unsupported image format '{explicit_format}'. Choose from: {list(SUPPORTED_IMAGE_FORMATS)}"
+            )
+        return explicit_format, SUPPORTED_IMAGE_FORMATS[explicit_format][1]
+    for fmt, (magic, ext, offset) in SUPPORTED_IMAGE_FORMATS.items():
+        if data[offset : offset + len(magic)] == magic:
+            if fmt == "webp" and data[8:12] != b"WEBP":
+                continue
+            return fmt, ext
+    raise ValueError(f"Unknown image format (first 16 bytes: {data[:16].hex()})")
 
 
 class LeRobotDatasetMetadata:
@@ -1049,11 +1074,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         )
         return self.root / fpath
 
-    def _get_image_file_path_jpg(self, episode_index: int, image_key: str, frame_index: int) -> Path:
-        fpath = DEFAULT_IMAGE_PATH_JPG.format(
-            image_key=image_key, episode_index=episode_index, frame_index=frame_index
-        )
+    def _get_image_file_path_ext(self, episode_index: int, image_key: str, frame_index: int, ext: str) -> Path:
+        fpath = f"images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}{ext}"
         return self.root / fpath
+
+    def _get_image_file_path_jpg(self, episode_index: int, image_key: str, frame_index: int) -> Path:
+        return self._get_image_file_path_ext(episode_index, image_key, frame_index, ".jpg")
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
@@ -1115,12 +1141,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self.episode_buffer["size"] += 1
 
-    def add_frame_bytes(self, frame: dict) -> None:
+    def add_frame_bytes(
+        self, frame: dict, format: str | dict[str, str] | None = None
+    ) -> None:
         """
-        Add a frame whose image/video features are already encoded bytes.
+        Add a frame whose image/video features are already encoded bytes (or decoded arrays).
 
-        This keeps JPEG payloads compressed while writing them to the temporary image directory, avoiding a
-        decode-to-array and re-encode-to-PNG cycle before video encoding.
+        Image keys may be either compressed bytes or decoded arrays — both are handled per key.
+        Bytes are written directly to disk in their native format; arrays go through _save_image.
+
+        Args:
+            frame: dict with feature keys. Image keys may be bytes/bytearray or array-like.
+            format: explicit format override for byte payloads.
+                None  → sniff magic bytes automatically per key.
+                str   → apply this format name to every image key (e.g. "jpeg").
+                dict  → per-key override (e.g. {"cam_left": "jpeg", "cam_right": "webp"}).
         """
         for name in frame:
             if isinstance(frame[name], torch.Tensor):
@@ -1144,14 +1179,20 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
 
             if self.features[key]["dtype"] in ["image", "video"]:
-                img_path = self._get_image_file_path_jpg(
-                    episode_index=self.episode_buffer["episode_index"],
-                    image_key=key,
-                    frame_index=frame_index,
-                )
-                if frame_index == 0:
-                    img_path.parent.mkdir(parents=True, exist_ok=True)
-                self._save_image_bytes(frame[key], img_path)
+                val = frame[key]
+                ep_idx = self.episode_buffer["episode_index"]
+                if isinstance(val, (bytes, bytearray)):
+                    key_fmt = format[key] if isinstance(format, dict) else format
+                    _, ext = resolve_image_format(val, key_fmt)
+                    img_path = self._get_image_file_path_ext(ep_idx, key, frame_index, ext)
+                    if frame_index == 0:
+                        img_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._save_image_bytes(val, img_path)
+                else:
+                    img_path = self._get_image_file_path(ep_idx, key, frame_index)
+                    if frame_index == 0:
+                        img_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._save_image(val, img_path)
                 self.episode_buffer[key].append(str(img_path))
             else:
                 self.episode_buffer[key].append(frame[key])
@@ -1527,8 +1568,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
-        vcodec = getattr(self, "vcodec", "libsvtav1")
-        encoding_kwargs = getattr(self, "encoding_kwargs", None) or {}
+        encoding_kwargs = dict(getattr(self, "encoding_kwargs", None) or {})
+        vcodec = encoding_kwargs.pop("vcodec", getattr(self, "vcodec", "libsvtav1"))
         encode_video_frames(
             img_dir, temp_path, self.fps, vcodec=vcodec, overwrite=True, **encoding_kwargs
         )
@@ -1558,8 +1599,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             has_frames = False
             for video_key in self.meta.video_keys:
                 img_dir = self._get_image_file_dir(ep_idx, video_key)
-                if img_dir.exists() and (
-                    any(img_dir.glob("*.png")) or any(img_dir.glob("*.jpg"))
+                if img_dir.exists() and any(
+                    img_dir.glob(f"*.{ext}") for ext in SUPPORTED_FRAME_EXTENSIONS
                 ):
                     has_frames = True
                     break

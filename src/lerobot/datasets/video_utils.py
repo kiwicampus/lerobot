@@ -33,6 +33,9 @@ from datasets.features.features import register_feature
 from PIL import Image
 
 
+SUPPORTED_FRAME_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif")
+
+
 def get_safe_default_codec():
     if importlib.util.find_spec("torchcodec"):
         return "torchcodec"
@@ -357,9 +360,9 @@ def encode_video_frames(
         )
         pix_fmt = "yuv420p"
 
-    # Get input frames. New byte-based conversion writes JPEG frames, while the legacy path writes PNGs.
+    # Get input frames. Search in priority order: jpg first (byte passthrough path), then others.
     input_list = []
-    for suffix in ("jpg", "png"):
+    for suffix in SUPPORTED_FRAME_EXTENSIONS:
         template = "frame-" + ("[0-9]" * 6) + f".{suffix}"
         input_list = sorted(
             glob.glob(str(imgs_dir / template)),
@@ -731,7 +734,7 @@ class VideoEncodingManager:
         # Clean up any remaining images directory if it's empty
         img_dir = self.dataset.root / "images"
         # Check for any remaining frame files
-        frame_files = list(img_dir.rglob("*.png")) + list(img_dir.rglob("*.jpg"))
+        frame_files = [f for ext in SUPPORTED_FRAME_EXTENSIONS for f in img_dir.rglob(f"*.{ext}")]
         if len(frame_files) == 0:
             # Only remove the images directory if no frame files remain
             if img_dir.exists():
