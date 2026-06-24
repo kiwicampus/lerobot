@@ -332,6 +332,7 @@ def encode_video_frames(
     overwrite: bool = False,
     bitrate: str = "8M",
     preset: str | None = None,
+    target_size: tuple[int, int] | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     # Check encoder availability
@@ -362,6 +363,7 @@ def encode_video_frames(
 
     # Get input frames. Search in priority order: jpg first (byte passthrough path), then others.
     input_list = []
+    found_suffix = None
     for suffix in SUPPORTED_FRAME_EXTENSIONS:
         template = "frame-" + ("[0-9]" * 6) + f".{suffix}"
         input_list = sorted(
@@ -369,13 +371,18 @@ def encode_video_frames(
             key=lambda x: int(Path(x).stem.split("-")[-1]),
         )
         if input_list:
+            found_suffix = suffix
             break
+    print(f'[DEBUG] Found {len(input_list)} frames (.{found_suffix}) in {imgs_dir.name} -> encoding to {Path(video_path).name}')
 
     # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
-    with Image.open(input_list[0]) as dummy_image:
-        width, height = dummy_image.size
+    if target_size is not None:
+        height, width = int(target_size[0]), int(target_size[1])
+    else:
+        with Image.open(input_list[0]) as dummy_image:
+            width, height = dummy_image.size
 
     # Define video codec options
     video_options = {}
@@ -423,9 +430,12 @@ def encode_video_frames(
         output_stream.height = height
 
         # Loop through input frames and encode them
-        for input_data in input_list:
+        for frame_idx, input_data in enumerate(input_list):
+            print(f'[DEBUG] Encoding frame {frame_idx} / {len(input_list) - 1}: {Path(input_data).name} -> {Path(video_path).name}')
             with Image.open(input_data) as input_image:
                 input_image = input_image.convert("RGB")
+                if target_size is not None:
+                    input_image = input_image.resize((width, height), Image.NEAREST)
                 input_frame = av.VideoFrame.from_image(input_image)
                 packet = output_stream.encode(input_frame)
                 if packet:

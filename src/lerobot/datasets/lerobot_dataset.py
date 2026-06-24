@@ -1182,8 +1182,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 val = frame[key]
                 ep_idx = self.episode_buffer["episode_index"]
                 if isinstance(val, (bytes, bytearray)):
-                    key_fmt = format[key] if isinstance(format, dict) else format
-                    _, ext = resolve_image_format(val, key_fmt)
+                    key_fmt = format.get(key) if isinstance(format, dict) else format
+                    fmt, ext = resolve_image_format(val, key_fmt)
                     img_path = self._get_image_file_path_ext(ep_idx, key, frame_index, ext)
                     if frame_index == 0:
                         img_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1570,6 +1570,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         img_dir = self._get_image_file_dir(episode_index, video_key)
         encoding_kwargs = dict(getattr(self, "encoding_kwargs", None) or {})
         vcodec = encoding_kwargs.pop("vcodec", getattr(self, "vcodec", "libsvtav1"))
+        per_key = getattr(self, "per_key_encoding_kwargs", None) or {}
+        encoding_kwargs.update(per_key.get(video_key, {}))
         encode_video_frames(
             img_dir, temp_path, self.fps, vcodec=vcodec, overwrite=True, **encoding_kwargs
         )
