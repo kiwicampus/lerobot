@@ -363,7 +363,6 @@ def encode_video_frames(
 
     # Get input frames. Search in priority order: jpg first (byte passthrough path), then others.
     input_list = []
-    found_suffix = None
     for suffix in SUPPORTED_FRAME_EXTENSIONS:
         template = "frame-" + ("[0-9]" * 6) + f".{suffix}"
         input_list = sorted(
@@ -371,7 +370,6 @@ def encode_video_frames(
             key=lambda x: int(Path(x).stem.split("-")[-1]),
         )
         if input_list:
-            found_suffix = suffix
             break
     
     # Define video output frame size (assuming all input frames are the same size)
