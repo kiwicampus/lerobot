@@ -116,8 +116,8 @@ def worker_thread_loop(queue: queue.Queue):
             data, fpath, _ = item
             fpath.write_bytes(data)
         else:
-            image_array, fpath = item
-            write_image(image_array, fpath)
+            image_array, fpath, compress_level = item
+            write_image(image_array, fpath, compress_level=compress_level)
         queue.task_done()
 
 
