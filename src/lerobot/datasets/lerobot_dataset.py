@@ -956,11 +956,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if not requested_episodes.issubset(available_episodes):
             return False
 
-        # Check if all required video files exist
+        # Check if all required video files exist. Episodes saved with defer_video_encoding=True
+        # have no video columns yet (encoding is pending), which counts as insufficient cache.
         if len(self.meta.video_keys) > 0:
             for ep_idx in requested_episodes:
                 for vid_key in self.meta.video_keys:
-                    video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                    try:
+                        video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                    except KeyError:
+                        return False
                     if not video_path.exists():
                         return False
 
