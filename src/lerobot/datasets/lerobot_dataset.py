@@ -576,13 +576,13 @@ def _encode_video_worker(
     root: Path,
     fps: int,
     vcodec: str = "libsvtav1",
-    encoder_threads: int | None = None,
+    encoding_kwargs: dict | None = None,
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
     encode_video_frames(
-        img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
+        img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, **(encoding_kwargs or {})
     )
     shutil.rmtree(img_dir)
     return temp_path
@@ -1417,18 +1417,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 # TODO(Steven): Ideally we would like to control the number of threads per encoding such that:
                 # num_cameras * num_threads = (total_cpu -1)
                 with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
-                    future_to_key = {
-                        executor.submit(
+                    future_to_key = {}
+                    for video_key in self.meta.video_keys:
+                        vcodec, encoding_kwargs = self._resolve_video_encoding_kwargs(video_key)
+                        future = executor.submit(
                             _encode_video_worker,
                             video_key,
                             episode_index,
                             self.root,
                             self.fps,
-                            self.vcodec,
-                            self._encoder_threads,
-                        ): video_key
-                        for video_key in self.meta.video_keys
-                    }
+                            vcodec,
+                            encoding_kwargs,
+                        )
+                        future_to_key[future] = video_key
 
                     results = {}
                     for future in concurrent.futures.as_completed(future_to_key):
@@ -1777,6 +1778,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_writer is not None:
             self.image_writer.wait_until_done()
 
+    def _resolve_video_encoding_kwargs(self, video_key: str) -> tuple[str, dict]:
+        """Resolve the effective vcodec and encode_video_frames kwargs for a video key,
+        applying dataset-wide encoding_kwargs and any per_key_encoding_kwargs override."""
+        encoding_kwargs = dict(getattr(self, "encoding_kwargs", None) or {})
+        vcodec = encoding_kwargs.pop("vcodec", getattr(self, "vcodec", "libsvtav1"))
+        encoding_kwargs.setdefault("encoder_threads", self._encoder_threads)
+        per_key = getattr(self, "per_key_encoding_kwargs", None) or {}
+        encoding_kwargs.update(per_key.get(video_key, {}))
+        return vcodec, encoding_kwargs
+
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """
         Use ffmpeg to convert frames stored as image files into mp4 videos.
@@ -1785,11 +1796,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         temp_path = Path(tempfile.mkdtemp(dir=self.root)) / f"{video_key}_{episode_index:03d}.mp4"
         img_dir = self._get_image_file_dir(episode_index, video_key)
-        encoding_kwargs = dict(getattr(self, "encoding_kwargs", None) or {})
-        vcodec = encoding_kwargs.pop("vcodec", getattr(self, "vcodec", "libsvtav1"))
-        encoding_kwargs.setdefault("encoder_threads", self._encoder_threads)
-        per_key = getattr(self, "per_key_encoding_kwargs", None) or {}
-        encoding_kwargs.update(per_key.get(video_key, {}))
+        vcodec, encoding_kwargs = self._resolve_video_encoding_kwargs(video_key)
         encode_video_frames(
             img_dir, temp_path, self.fps, vcodec=vcodec, overwrite=True, **encoding_kwargs
         )
