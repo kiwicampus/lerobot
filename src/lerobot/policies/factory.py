@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, TypedDict
+
+from typing_extensions import Unpack
 
 import torch
 

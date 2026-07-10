@@ -16,6 +16,7 @@
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
+from typing import Generic, TypeVar
 
 import datasets
 import numpy as np
@@ -55,7 +56,10 @@ class LookAheadError(Exception):
     pass
 
 
-class Backtrackable[T]:
+_T = TypeVar("_T")
+
+
+class Backtrackable(Generic[_T]):
     """
     Wrap any iterator/iterable so you can step back up to `history` items
     and look ahead up to `lookahead` items.
@@ -89,23 +93,23 @@ class Backtrackable[T]:
 
     __slots__ = ("_source", "_back_buf", "_ahead_buf", "_cursor", "_history", "_lookahead")
 
-    def __init__(self, iterable: Iterable[T], *, history: int = 1, lookahead: int = 0):
+    def __init__(self, iterable: Iterable[_T], *, history: int = 1, lookahead: int = 0):
         if history < 1:
             raise ValueError("history must be >= 1")
         if lookahead <= 0:
             raise ValueError("lookahead must be > 0")
 
-        self._source: Iterator[T] = iter(iterable)
-        self._back_buf: deque[T] = deque(maxlen=history)
-        self._ahead_buf: deque[T] = deque(maxlen=lookahead) if lookahead > 0 else deque()
+        self._source: Iterator[_T] = iter(iterable)
+        self._back_buf: deque[_T] = deque(maxlen=history)
+        self._ahead_buf: deque[_T] = deque(maxlen=lookahead) if lookahead > 0 else deque()
         self._cursor: int = 0
         self._history = history
         self._lookahead = lookahead
 
-    def __iter__(self) -> "Backtrackable[T]":
+    def __iter__(self) -> "Backtrackable[_T]":
         return self
 
-    def __next__(self) -> T:
+    def __next__(self) -> _T:
         # If we've stepped back, consume from back buffer first
         if self._cursor < 0:  # -1 means "last item", etc.
             self._cursor += 1
@@ -119,7 +123,7 @@ class Backtrackable[T]:
         self._cursor = 0
         return item
 
-    def prev(self) -> T:
+    def prev(self) -> _T:
         """
         Step one item back in history and return it.
         Raises IndexError if already at the oldest buffered item.
@@ -130,7 +134,7 @@ class Backtrackable[T]:
         self._cursor -= 1
         return self._back_buf[self._cursor]
 
-    def peek_back(self, n: int = 1) -> T:
+    def peek_back(self, n: int = 1) -> _T:
         """
         Look `n` items back (n=1 == previous item) without moving the cursor.
         """
@@ -139,7 +143,7 @@ class Backtrackable[T]:
 
         return self._back_buf[self._cursor - (n + 1)]
 
-    def peek_ahead(self, n: int = 1) -> T:
+    def peek_ahead(self, n: int = 1) -> _T:
         """
         Look `n` items ahead (n=1 == next item) without moving the cursor.
         Fills the ahead buffer if necessary.
@@ -160,7 +164,7 @@ class Backtrackable[T]:
 
         return self._ahead_buf[n - 1]
 
-    def history(self) -> list[T]:
+    def history(self) -> list[_T]:
         """
         Return a copy of the buffered history (most recent last).
         The list length ≤ `history` argument passed at construction.
