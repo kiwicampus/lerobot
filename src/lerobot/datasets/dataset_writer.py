@@ -69,6 +69,7 @@ def _encode_video_worker(
     fps: int,
     camera_encoder: VideoEncoderConfig | None = None,
     encoder_threads: int | None = None,
+    encode_kwargs: dict | None = None,
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
@@ -80,6 +81,7 @@ def _encode_video_worker(
         camera_encoder=camera_encoder,
         encoder_threads=encoder_threads,
         overwrite=True,
+        **(encode_kwargs or {}),
     )
     shutil.rmtree(img_dir)
     return temp_path
@@ -124,6 +126,10 @@ class DatasetWriter:
         self._encoder_threads = encoder_threads
         self._batch_encoding_size = batch_encoding_size
         self._streaming_encoder = streaming_encoder
+
+        # Per-camera overrides for encode_video_frames-only kwargs (e.g. target_size, bitrate)
+        # that don't fit VideoEncoderConfig. Keyed by video_key. Empty by default.
+        self.per_key_encoding_kwargs: dict[str, dict] = {}
 
         # Writer state
         self.image_writer: AsyncImageWriter | None = None
@@ -362,8 +368,9 @@ class DatasetWriter:
             num_cameras = len(self._meta.video_keys)
             if parallel_encoding and num_cameras > 1:
                 with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
-                    future_to_key = {
-                        executor.submit(
+                    future_to_key = {}
+                    for video_key in self._meta.video_keys:
+                        future = executor.submit(
                             _encode_video_worker,
                             video_key,
                             episode_index,
@@ -371,9 +378,9 @@ class DatasetWriter:
                             self._meta.fps,
                             self._camera_encoder,
                             self._encoder_threads,
-                        ): video_key
-                        for video_key in self._meta.video_keys
-                    }
+                            self._resolve_video_encoding_kwargs(video_key),
+                        )
+                        future_to_key[future] = video_key
 
                     results = {}
                     for future in concurrent.futures.as_completed(future_to_key):
@@ -646,6 +653,11 @@ class DatasetWriter:
         if self.image_writer is not None:
             self.image_writer.wait_until_done()
 
+    def _resolve_video_encoding_kwargs(self, video_key: str) -> dict:
+        """Return encode_video_frames-only kwargs (e.g. target_size, bitrate) for this video key,
+        applying any per-camera override set via ``per_key_encoding_kwargs``."""
+        return dict(self.per_key_encoding_kwargs.get(video_key, {}))
+
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """Use ffmpeg to convert frames stored as png into mp4 videos."""
         return _encode_video_worker(
@@ -655,6 +667,7 @@ class DatasetWriter:
             self._meta.fps,
             self._camera_encoder,
             self._encoder_threads,
+            self._resolve_video_encoding_kwargs(video_key),
         )
 
     def close_writer(self) -> None:
