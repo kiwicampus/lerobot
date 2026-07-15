@@ -99,6 +99,7 @@ def _check_option_value(vcodec: str, label: str, value: Any, opt: av.option.Opti
             )
 
         # Check integer type compatibility
+        # NOTE: coerce to float before calling is_integer(); int.is_integer() only exists on Python 3.12+.
         if type_name in FFMPEG_INTEGER_OPTION_TYPES and not float(num_val).is_integer():
             raise ValueError(
                 f"{label}={num_val!r} must be an integer for codec {vcodec!r} "
