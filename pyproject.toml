@@ -82,7 +82,6 @@ dependencies = [
 
     "draccus==0.10.0", # TODO: Remove ==
     "gymnasium>=1.0.0",
-    "rerun-sdk>=0.24.0,<0.27.0",
 
     # Support dependencies
     "deepdiff>=7.0.1,<9.0.0",
@@ -92,6 +91,9 @@ dependencies = [
 
 # Optional dependencies
 [project.optional-dependencies]
+# rerun needs numpy>=2 — impossible on robots pinned to numpy 1.26 (SDK/ROS ABI).
+# Visualization-only dependency, so opt-in: pip install -e ".[rerun]"
+rerun = ["rerun-sdk>=0.24.0,<0.27.0"]
 
 # Common
 pygame-dep = ["pygame>=2.5.1,<2.7.0"]
