@@ -554,8 +554,18 @@ def encode_video_frames(
         # "While less efficient, it is generally preferable to modify logging with Python's logging"
         logging.getLogger("libav").setLevel(log_level)
 
-    # Create and open output file (overwrite by default)
-    with av.open(str(video_path), "w") as output:
+    # Create and open output file (overwrite by default).
+    #
+    # BUGFIX(mp4-last-frame-dropped): PyAV hands libav packets with duration == 0, and the
+    # plain mp4 muxer needs the final sample's duration to build the sample table. For some
+    # frame counts it silently drops that last packet instead — reproduced on h264_nvmpi
+    # *and* libx264 at 40, 46 and 100 frames (41-45, 47, 99 are fine), which yields a video
+    # one frame shorter than the episode's parquet rows. The mp4 header still advertises the
+    # correct count, so only counting actual packets reveals it. A fragmented mp4 is
+    # self-describing per fragment, so nothing is dropped and timestamps stay exactly 1/fps
+    # apart.
+    output_options = {"movflags": "frag_keyframe+empty_moov"} if video_path.suffix == ".mp4" else None
+    with av.open(str(video_path), "w", options=output_options) as output:
         output_stream = output.add_stream(vcodec, fps, options=video_options)
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width
@@ -701,8 +711,21 @@ def concatenate_video_files(
     Concatenate multiple video files into a single video file using pyav.
 
     This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
+    output video file. Packets are stream-copied (no re-encoding) and each input is shifted
+    by an exact whole number of frame durations.
+
+    BUGFIX(concat-timestamp-drift): this used to hand the inputs to libav's concat demuxer,
+    which offsets each one by that input's *container duration*. That duration is only an
+    estimate for the final sample (PyAV cannot set ``AVPacket.duration``, so encoders leave
+    it at 0 and libav guesses), so each episode landed a few ticks late. The error
+    accumulates through ``videos/<key>/from_timestamp`` and immediately exceeded the
+    reader's ``tolerance_s``, making frames at an episode boundary unreadable:
+
+        FrameTimestampError: query timestamps violate the tolerance
+        (0.0007 > tolerance_s=0.0001); queried 74.1333, loaded 74.1340
+
+    Counting packets and stepping by exactly 1/fps is correct for the constant-rate video
+    LeRobot writes.
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -711,9 +734,9 @@ def concatenate_video_files(
         compatibility_check: Whether to check if the input videos are compatible. Default is False.
 
     Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+        - All inputs must share codec, resolution and frame rate.
+        - Relative PTS/DTS within an input are preserved, so this stays correct for streams
+          with B-frames.
     """
 
     output_video_path = Path(output_video_path)
@@ -743,55 +766,59 @@ def concatenate_video_files(
                     f"Input video {input_path} is not compatible with the reference video {input_video_paths[0]}."
                 )
 
-    # Create a temporary .ffconcat file to list the input video paths
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
-        tmp_concatenate_file.write("ffconcat version 1.0\n")
-        for input_path in input_video_paths:
-            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
-        tmp_concatenate_file.flush()
-        tmp_concatenate_path = tmp_concatenate_file.name
-
-    # Create input and output containers
-    input_container = av.open(
-        tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
-
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+    # faststart moves the metadata to the beginning of the file to speed up loading
+    output_container = av.open(tmp_output_video_path, mode="w", options={"movflags": "faststart"})
 
-    # Replicate input streams in output container
-    stream_map = {}
-    for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
-            )
+    output_stream = None
+    time_base = None
+    ticks_per_frame = 0
+    ticks_offset = 0
+    try:
+        for input_path in input_video_paths:
+            with av.open(str(input_path)) as input_container:
+                input_stream = input_container.streams.video[0]
+                if output_stream is None:
+                    # BUGFIX(pyav10-add-stream-template): add_stream_from_template() is
+                    # PyAV >= 13 only. The Jetson l4t-tegra image ships PyAV 10, where the
+                    # template form is add_stream(template=...) — calling the former raised
+                    # AttributeError on any multi-episode conversion.
+                    if hasattr(output_container, "add_stream_from_template"):
+                        output_stream = output_container.add_stream_from_template(
+                            template=input_stream, opaque=True
+                        )
+                    else:
+                        output_stream = output_container.add_stream(template=input_stream)
+                    # time base is missing in the codec context
+                    time_base = input_stream.time_base
+                    output_stream.time_base = time_base
+                    rate = input_stream.average_rate or input_stream.base_rate
+                    ticks_per_frame = int(round(float(1 / rate) / float(time_base)))
 
-            # set the time base to the input stream time base (missing in the codec context)
-            stream_map[input_stream.index].time_base = input_stream.time_base
+                # BUGFIX(concat-timestamp-drift): shift this input by an exact whole number
+                # of frame durations rather than by its estimated container duration. See
+                # the docstring for why the concat demuxer cannot be used here.
+                base_dts = None
+                n_packets = 0
+                for packet in input_container.demux(input_stream):
+                    if packet.dts is None:  # demuxer flush packet
+                        continue
+                    if base_dts is None:
+                        base_dts = packet.dts
+                    packet.stream = output_stream
+                    packet.dts = packet.dts - base_dts + ticks_offset
+                    if packet.pts is not None:
+                        packet.pts = packet.pts - base_dts + ticks_offset
+                    output_container.mux(packet)
+                    n_packets += 1
 
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
+                ticks_offset += n_packets * ticks_per_frame
+    finally:
+        output_container.close()
 
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
-
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
     shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
 
 
 class _CameraEncoderThread(threading.Thread):
@@ -1251,6 +1278,33 @@ def get_video_pixel_channels(pix_fmt: str) -> int:
         return 3
     else:
         raise ValueError("Unknown format")
+
+
+def get_video_frame_count(video_path: Path | str) -> int:
+    """Return the number of video packets in ``video_path`` (demux only, no decoding).
+
+    For the constant-frame-rate video LeRobot writes, one packet is one frame.
+
+    BUGFIX(mp4-last-frame-dropped) support: the mp4 header's advertised frame count can
+    disagree with how many packets the file actually holds, so callers that need to trust
+    the length must count packets rather than read stream metadata.
+    """
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        return sum(1 for packet in container.demux(stream) if packet.dts is not None)
+
+
+def get_exact_video_duration_in_s(video_path: Path | str, fps: int) -> float:
+    """Return a video's duration as ``frame_count / fps``.
+
+    BUGFIX(concat-timestamp-drift): prefer this over :func:`get_video_duration_in_s` for
+    episode bookkeeping. The container's own duration is only an estimate for the final
+    sample (PyAV cannot set ``AVPacket.duration``, so encoders leave it at 0 and libav
+    guesses). That error is summed into ``videos/<key>/to_timestamp`` /
+    ``from_timestamp`` across episodes until frames near an episode boundary fall outside
+    the reader's ``tolerance_s``.
+    """
+    return get_video_frame_count(video_path) / float(fps)
 
 
 def get_video_duration_in_s(video_path: Path | str) -> float:

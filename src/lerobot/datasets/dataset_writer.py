@@ -56,7 +56,7 @@ from .video_utils import (
     StreamingVideoEncoder,
     concatenate_video_files,
     encode_video_frames,
-    get_video_duration_in_s,
+    get_exact_video_duration_in_s,
 )
 
 logger = logging.getLogger(__name__)
@@ -537,7 +537,12 @@ class DatasetWriter:
             ep_path = temp_path
 
         ep_size_in_mb = get_file_size_in_mb(ep_path)
-        ep_duration_in_s = get_video_duration_in_s(ep_path)
+        # BUGFIX(concat-timestamp-drift): exact frame_count / fps, not the container's
+        # duration estimate. This value is summed into to_timestamp / from_timestamp across
+        # episodes, so a per-episode rounding error here accumulates until reads near an
+        # episode boundary fail the reader's tolerance_s check. Was
+        # get_video_duration_in_s(ep_path).
+        ep_duration_in_s = get_exact_video_duration_in_s(ep_path, self._meta.fps)
 
         if (
             episode_index == 0
