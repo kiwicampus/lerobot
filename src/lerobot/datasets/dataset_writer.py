@@ -22,6 +22,7 @@ import contextlib
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import datasets
@@ -141,6 +142,11 @@ class DatasetWriter:
         self._recorded_frames: int = initial_frames
         self._finalized = False
 
+        # Wall-clock breakdown of the most recent save_episode() call, in seconds.
+        # Populated on every save_episode(); callers (e.g. conversion scripts) read it
+        # to report where episode-save time actually goes.
+        self.last_save_timings: dict[str, float] = {}
+
     def _create_episode_buffer(self, episode_index: int | None = None) -> dict:
         current_ep_idx = self._meta.total_episodes if episode_index is None else episode_index
         ep_buffer = {}
@@ -211,6 +217,19 @@ class DatasetWriter:
         self.episode_buffer["timestamp"].append(timestamp)
         self.episode_buffer["task"].append(frame.pop("task"))
 
+        # Start streaming encoder on first frame of episode, unless the caller already
+        # started it (an encoder that knows the whole episode up front can begin work
+        # before the buffer is filled).
+        if (
+            frame_index == 0
+            and self._streaming_encoder is not None
+            and not getattr(self._streaming_encoder, "episode_active", False)
+        ):
+            self._streaming_encoder.start_episode(
+                video_keys=list(self._meta.video_keys),
+                temp_dir=self._root,
+            )
+
         ep_idx = self.episode_buffer["episode_index"]
         for key in frame:
             if key not in self._meta.features:
@@ -218,7 +237,13 @@ class DatasetWriter:
                     f"An element of the frame is not in the features. '{key}' not in '{self._meta.features.keys()}'."
                 )
 
-            if self._meta.features[key]["dtype"] in ["image", "video"]:
+            if self._meta.features[key]["dtype"] == "video" and self._streaming_encoder is not None:
+                # Video goes to the encoder, not to disk: no per-frame image file is
+                # written and the buffer only needs a placeholder (video columns are
+                # not persisted to parquet).
+                self._streaming_encoder.feed_frame(key, frame[key])
+                self.episode_buffer[key].append(None)
+            elif self._meta.features[key]["dtype"] in ["image", "video"]:
                 val = frame[key]
                 if isinstance(val, (bytes, bytearray)):
                     key_fmt = format.get(key) if isinstance(format, dict) else format
@@ -266,8 +291,13 @@ class DatasetWriter:
         self.episode_buffer["timestamp"].append(timestamp)
         self.episode_buffer["task"].append(frame.pop("task"))
 
-        # Start streaming encoder on first frame of episode
-        if frame_index == 0 and self._streaming_encoder is not None:
+        # Start streaming encoder on first frame of episode, unless the caller already
+        # started it (see add_frame_bytes).
+        if (
+            frame_index == 0
+            and self._streaming_encoder is not None
+            and not getattr(self._streaming_encoder, "episode_active", False)
+        ):
             self._streaming_encoder.start_episode(
                 video_keys=list(self._meta.video_keys),
                 temp_dir=self._root,
@@ -304,6 +334,8 @@ class DatasetWriter:
     ) -> None:
         """Save the current episode in self.episode_buffer to disk."""
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
+        _t_save_start = time.perf_counter()
+        timings: dict[str, float] = {}
 
         validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
 
@@ -335,12 +367,15 @@ class DatasetWriter:
             episode_buffer[key] = stacked_values
 
         # Wait for image writer to end, so that episode stats over images can be computed
+        _t = time.perf_counter()
         self._wait_image_writer()
+        timings["wait_image_writer"] = time.perf_counter() - _t
 
         has_video_keys = len(self._meta.video_keys) > 0
         use_streaming = self._streaming_encoder is not None and has_video_keys
         use_batched_encoding = self._batch_encoding_size > 1
 
+        _t = time.perf_counter()
         if use_streaming:
             non_video_buffer = {
                 k: v
@@ -351,8 +386,12 @@ class DatasetWriter:
             ep_stats = compute_episode_stats(non_video_buffer, non_video_features)
         else:
             ep_stats = compute_episode_stats(episode_buffer, self._meta.features)
+        timings["compute_episode_stats"] = time.perf_counter() - _t
 
+        _t = time.perf_counter()
         ep_metadata = self._save_episode_data(episode_buffer)
+        timings["save_parquet"] = time.perf_counter() - _t
+        _t_encode = time.perf_counter()
 
         if use_streaming:
             streaming_results = self._streaming_encoder.finish_episode()
@@ -401,8 +440,12 @@ class DatasetWriter:
                 for video_key in self._meta.video_keys:
                     ep_metadata.update(self._save_episode_video(video_key, episode_index))
 
+        timings["encode_videos"] = time.perf_counter() - _t_encode
+
         # `meta.save_episode` need to be executed after encoding the videos
+        _t = time.perf_counter()
         self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
+        timings["save_meta"] = time.perf_counter() - _t
 
         if has_video_keys and use_batched_encoding:
             self._episodes_since_last_encoding += 1
@@ -413,7 +456,12 @@ class DatasetWriter:
                 self._episodes_since_last_encoding = 0
 
         if episode_data is None:
+            _t = time.perf_counter()
             self.clear_episode_buffer(delete_images=len(self._meta.image_keys) > 0)
+            timings["clear_buffer"] = time.perf_counter() - _t
+
+        timings["total"] = time.perf_counter() - _t_save_start
+        self.last_save_timings = timings
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """Batch save videos for multiple episodes."""
@@ -466,7 +514,11 @@ class DatasetWriter:
         hf_features = get_hf_features_from_features(self._meta.features)
         ep_dict = {key: episode_buffer[key] for key in hf_features}
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=hf_features, split="train")
-        ep_dataset = embed_images(ep_dataset)
+        # embed_images() is a row-by-row Dataset.map() used to inline image bytes into the
+        # table. With no `image` features there is nothing to inline, and the map still
+        # costs one Python call per frame (seconds per episode on long recordings).
+        if self._meta.image_keys:
+            ep_dataset = embed_images(ep_dataset)
         ep_num_frames = len(ep_dataset)
 
         if self._latest_episode is None:

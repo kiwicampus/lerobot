@@ -46,6 +46,87 @@ from lerobot.utils.import_utils import get_safe_default_video_backend
 
 SUPPORTED_FRAME_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif")
 
+# Frame extensions we can hand to libav's mjpeg decoder, which yields a planar YUV
+# frame in the encoder's native layout. Going JPEG -> yuvj420p -> yuv420p skips the
+# JPEG -> RGB -> YUV double colour conversion that PIL + VideoFrame.from_image()
+# forces, which on Jetson (h264_nvmpi) is ~4x faster end to end and slightly more
+# faithful (no 4:2:0 -> 4:4:4 -> 4:2:0 chroma round trip).
+_MJPEG_FRAME_EXTENSIONS = ("jpg", "jpeg")
+
+
+def _read_frame_bytes_ahead(paths: list[str], read_ahead: int = 8):
+    """Yield file contents for ``paths`` in order, reading ahead in a helper thread.
+
+    Overlaps page-cache/NVMe reads with decode+encode work, which are the actual
+    bottleneck. Falls back to plain sequential reads when ``read_ahead <= 0``.
+    """
+    if read_ahead <= 0:
+        for path in paths:
+            with open(path, "rb") as fh:
+                yield fh.read()
+        return
+
+    out_queue: queue.Queue = queue.Queue(maxsize=read_ahead)
+    sentinel = object()
+
+    def _reader() -> None:
+        try:
+            for path in paths:
+                with open(path, "rb") as fh:
+                    out_queue.put(fh.read())
+        except Exception as exc:  # surfaced to the consumer below
+            out_queue.put(exc)
+        else:
+            out_queue.put(sentinel)
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    while True:
+        item = out_queue.get()
+        if item is sentinel:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+def _prepare_frame_for_encoder(
+    frame: av.VideoFrame, pix_fmt: str, width: int, height: int
+) -> av.VideoFrame:
+    """Convert ``frame`` to the encoder's pixel format / size, skipping no-op conversions.
+
+    JPEG decodes to the full-range ``yuvj420p``; the explicit reformat to ``yuv420p`` is
+    what applies the full -> limited range scaling (the same scaling the old
+    RGB -> YUV path applied), so it must not be skipped.
+    """
+    if frame.width != width or frame.height != height:
+        return frame.reformat(width=width, height=height, format=pix_fmt)
+    if frame.format.name != pix_fmt:
+        return frame.reformat(format=pix_fmt)
+    return frame
+
+
+def _iter_encoder_frames(
+    input_list: list[str], suffix: str, pix_fmt: str, width: int, height: int, use_mjpeg: bool
+):
+    """Yield encoder-ready :class:`av.VideoFrame` objects for the given frame files."""
+    if use_mjpeg:
+        # One complete JPEG per file => one packet => exactly one frame. Feeding
+        # packets directly (instead of CodecContext.parse) avoids the parser
+        # buffering the final frame, which would silently drop it.
+        codec_ctx = av.CodecContext.create("mjpeg", "r")
+        for data in _read_frame_bytes_ahead(input_list):
+            for frame in codec_ctx.decode(av.Packet(data)):
+                yield _prepare_frame_for_encoder(frame, pix_fmt, width, height)
+        return
+
+    for input_data in input_list:
+        with Image.open(input_data) as input_image:
+            input_image = input_image.convert("RGB")
+            if input_image.size != (width, height):
+                input_image = input_image.resize((width, height), Image.NEAREST)
+            yield av.VideoFrame.from_image(input_image)
+
 logger = logging.getLogger(__name__)
 
 def get_safe_default_codec():
@@ -456,6 +537,7 @@ def encode_video_frames(
     bitrate: str = "8M",
     preset: str | None = None,
     target_size: tuple[int, int] | None = None,
+    jpeg_decoder: str = "libav",
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     if camera_encoder is None:
@@ -497,6 +579,7 @@ def encode_video_frames(
 
     # Get input frames. Search in priority order: jpg first (byte passthrough path), then others.
     input_list = []
+    frame_suffix = ""
     for suffix in SUPPORTED_FRAME_EXTENSIONS:
         template = "frame-" + ("[0-9]" * 6) + f".{suffix}"
         input_list = sorted(
@@ -504,6 +587,7 @@ def encode_video_frames(
             key=lambda x: int(Path(x).stem.split("-")[-1]),
         )
         if input_list:
+            frame_suffix = suffix
             break
 
     if len(input_list) == 0:
@@ -513,6 +597,13 @@ def encode_video_frames(
     else:
         with Image.open(input_list[0]) as dummy_image:
             width, height = dummy_image.size
+
+    # jpeg_decoder="pil" forces the slower PIL -> RGB -> swscale route even for JPEG input.
+    # It exists so the cost of the mjpeg fast path can be measured; see
+    # _MJPEG_FRAME_EXTENSIONS.
+    if jpeg_decoder not in ("libav", "pil"):
+        raise ValueError(f"jpeg_decoder must be 'libav' or 'pil', got {jpeg_decoder!r}")
+    use_mjpeg = jpeg_decoder == "libav" and frame_suffix in _MJPEG_FRAME_EXTENSIONS
 
     # Define video codec options
     video_options = {}
@@ -563,7 +654,7 @@ def encode_video_frames(
     # one frame shorter than the episode's parquet rows. The mp4 header still advertises the
     # correct count, so only counting actual packets reveals it. A fragmented mp4 is
     # self-describing per fragment, so nothing is dropped and timestamps stay exactly 1/fps
-    # apart.
+    # apart. Unrelated to the conversion-speed work; see OPTIMIZATION_REPORT.md.
     output_options = {"movflags": "frag_keyframe+empty_moov"} if video_path.suffix == ".mp4" else None
     with av.open(str(video_path), "w", options=output_options) as output:
         output_stream = output.add_stream(vcodec, fps, options=video_options)
@@ -572,15 +663,12 @@ def encode_video_frames(
         output_stream.height = height
 
         # Loop through input frames and encode them
-        for frame_idx, input_data in enumerate(input_list):
-            with Image.open(input_data) as input_image:
-                input_image = input_image.convert("RGB")
-                if target_size is not None:
-                    input_image = input_image.resize((width, height), Image.NEAREST)
-                input_frame = av.VideoFrame.from_image(input_image)
-                packet = output_stream.encode(input_frame)
-                if packet:
-                    output.mux(packet)
+        for input_frame in _iter_encoder_frames(
+            input_list, frame_suffix, pix_fmt, width, height, use_mjpeg
+        ):
+            packet = output_stream.encode(input_frame)
+            if packet:
+                output.mux(packet)
 
         # Flush the encoder
         packet = output_stream.encode()
@@ -725,7 +813,7 @@ def concatenate_video_files(
         (0.0007 > tolerance_s=0.0001); queried 74.1333, loaded 74.1340
 
     Counting packets and stepping by exactly 1/fps is correct for the constant-rate video
-    LeRobot writes.
+    LeRobot writes. Unrelated to the conversion-speed work; see OPTIMIZATION_REPORT.md.
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -980,6 +1068,11 @@ class StreamingVideoEncoder:
         self._dropped_frames: dict[str, int] = {}
         self._episode_active = False
         self._closed = False
+
+    @property
+    def episode_active(self) -> bool:
+        """Whether an episode is currently being encoded."""
+        return self._episode_active
 
     def start_episode(self, video_keys: list[str], temp_dir: Path) -> None:
         """Start encoder threads for a new episode.
