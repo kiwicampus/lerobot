@@ -657,6 +657,11 @@ def encode_video_frames(
     if not video_path.exists():
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
+    # read back through a demuxer so that the final packet carries an explicit
+    # duration and the destination muxer never has to estimate. 
+    if video_path.suffix == ".mp4":
+        concatenate_video_files([video_path], video_path, overwrite=True)
+
 
 def reencode_video(
     input_video_path: Path | str,
@@ -841,11 +846,13 @@ def concatenate_video_files(
                     # time base is missing in the codec context
                     time_base = input_stream.time_base
                     output_stream.time_base = time_base
-                    rate = input_stream.average_rate or input_stream.base_rate
+                    # prefer base_rate. average_rate is frames / header-duration *problematic on a fragmented mp4)
+                    rate = input_stream.base_rate or input_stream.average_rate
                     ticks_per_frame = int(round(float(1 / rate) / float(time_base)))
 
                 base_dts = None
                 n_packets = 0
+                max_dts = None
                 for packet in input_container.demux(input_stream):
                     if packet.dts is None:  # demuxer flush packet
                         continue
@@ -855,10 +862,16 @@ def concatenate_video_files(
                     packet.dts = packet.dts - base_dts + ticks_offset
                     if packet.pts is not None:
                         packet.pts = packet.pts - base_dts + ticks_offset
+                    max_dts = packet.dts if max_dts is None else max(max_dts, packet.dts)
                     output_container.mux(packet)
                     n_packets += 1
 
-                ticks_offset += n_packets * ticks_per_frame
+                # advance past whichever is later, the nominal end or one frame past the highest dts  
+                nominal_end = ticks_offset + n_packets * ticks_per_frame
+                if max_dts is None:
+                    ticks_offset = nominal_end
+                else:
+                    ticks_offset = max(nominal_end, max_dts + ticks_per_frame)
     finally:
         output_container.close()
 

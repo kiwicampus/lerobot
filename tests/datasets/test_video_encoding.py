@@ -481,6 +481,64 @@ class TestEncodeVideoFrames:
         assert info["video.extra_options"] == {}
 
 
+class TestMp4HeaderDurationExactness:
+    """BUGFIX(mp4-last-frame-dropped): the mp4 header must not under-report duration.
+
+    PyAV cannot assign ``AVPacket.duration`` (read-only through at least PyAV 10), so
+    encoder packets reach libav with ``duration == 0``. Writing a fragmented mp4 stops
+    the muxer from *dropping* the final sample, but the header is still one frame short
+    whenever the final fragment holds a single packet: the muxer estimates a fragment's
+    last packet duration from the delta to the previous packet in that fragment, and a
+    single-packet fragment has no such delta.
+
+    With the default ``g=2`` keyframes land on every even frame index, so an odd frame
+    count puts the last frame (index N-1, even) on a keyframe and gives it a fragment of
+    its own. The odd counts below are the regression guard; the even ones prove the fix
+    did not regress the case that already worked.
+
+    ``TestEncodeVideoFrames.test_frame_count_and_duration_match_input`` allows 0.1 s of
+    slack -- three frames at 30 fps -- which is why it never caught this.
+    """
+
+    WIDTH, HEIGHT = 256, 144
+
+    @staticmethod
+    def _measure(video_path: Path) -> tuple[int, float]:
+        """Return (packets actually in the file, duration the header advertises)."""
+        with av.open(str(video_path)) as container:
+            stream = container.streams.video[0]
+            header_s = float(stream.duration * stream.time_base)
+        # demux in a second pass: counting packets consumes the container
+        with av.open(str(video_path)) as container:
+            stream = container.streams.video[0]
+            packets = sum(1 for packet in container.demux(stream) if packet.dts is not None)
+        return packets, header_s
+
+    @pytest.mark.parametrize("num_frames", [40, 46, 47, 99, 100, 101])
+    @pytest.mark.parametrize("vcodec", ["h264", "h264_nvmpi"])
+    def test_header_duration_is_exact(self, tmp_path, vcodec, num_frames):
+        if get_codec(vcodec) is None:
+            pytest.skip(f"{vcodec!r} not in local FFmpeg build")
+        fps = 30
+        imgs_dir = tmp_path / "imgs"
+        _write_frames(imgs_dir, num_frames=num_frames, height=self.HEIGHT, width=self.WIDTH)
+        video_path = tmp_path / "out.mp4"
+        encode_video_frames(
+            imgs_dir,
+            video_path,
+            fps=fps,
+            camera_encoder=VideoEncoderConfig(vcodec=vcodec, g=2),
+            overwrite=True,
+        )
+
+        packets, header_s = self._measure(video_path)
+
+        assert packets == num_frames, f"muxer lost a frame: {packets} of {num_frames}"
+        # One frame at 30 fps is 0.0333 s. Half a frame of slack makes a one-frame
+        # shortfall always fail while tolerating sub-tick rounding.
+        assert header_s == pytest.approx(num_frames / fps, abs=0.5 / fps)
+
+
 class TestReencodeVideo:
     @require_libsvtav1
     @require_h264
