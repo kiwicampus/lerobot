@@ -46,19 +46,11 @@ from lerobot.utils.import_utils import get_safe_default_video_backend
 
 SUPPORTED_FRAME_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif")
 
-# Frame extensions we can hand to libav's mjpeg decoder, which yields a planar YUV
-# frame in the encoder's native layout. Going JPEG -> yuvj420p -> yuv420p skips the
-# JPEG -> RGB -> YUV double colour conversion that PIL + VideoFrame.from_image()
-# forces, which on Jetson (h264_nvmpi) is ~4x faster end to end and slightly more
-# faithful (no 4:2:0 -> 4:4:4 -> 4:2:0 chroma round trip).
-_MJPEG_FRAME_EXTENSIONS = ("jpg", "jpeg")
+_MJPEG_FRAME_EXTENSIONS = ("jpg", "jpeg") # Frame extensions supported by libav's mjpeg decoder, to avoid unnecessary color conversions.
 
 
 def _read_frame_bytes_ahead(paths: list[str], read_ahead: int = 8):
     """Yield file contents for ``paths`` in order, reading ahead in a helper thread.
-
-    Overlaps page-cache/NVMe reads with decode+encode work, which are the actual
-    bottleneck. Falls back to plain sequential reads when ``read_ahead <= 0``.
     """
     if read_ahead <= 0:
         for path in paths:
@@ -111,9 +103,6 @@ def _iter_encoder_frames(
 ):
     """Yield encoder-ready :class:`av.VideoFrame` objects for the given frame files."""
     if use_mjpeg:
-        # One complete JPEG per file => one packet => exactly one frame. Feeding
-        # packets directly (instead of CodecContext.parse) avoids the parser
-        # buffering the final frame, which would silently drop it.
         codec_ctx = av.CodecContext.create("mjpeg", "r")
         for data in _read_frame_bytes_ahead(input_list):
             for frame in codec_ctx.decode(av.Packet(data)):
@@ -537,7 +526,6 @@ def encode_video_frames(
     bitrate: str = "8M",
     preset: str | None = None,
     target_size: tuple[int, int] | None = None,
-    jpeg_decoder: str = "libav",
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     if camera_encoder is None:
@@ -598,12 +586,7 @@ def encode_video_frames(
         with Image.open(input_list[0]) as dummy_image:
             width, height = dummy_image.size
 
-    # jpeg_decoder="pil" forces the slower PIL -> RGB -> swscale route even for JPEG input.
-    # It exists so the cost of the mjpeg fast path can be measured; see
-    # _MJPEG_FRAME_EXTENSIONS.
-    if jpeg_decoder not in ("libav", "pil"):
-        raise ValueError(f"jpeg_decoder must be 'libav' or 'pil', got {jpeg_decoder!r}")
-    use_mjpeg = jpeg_decoder == "libav" and frame_suffix in _MJPEG_FRAME_EXTENSIONS
+    use_mjpeg = frame_suffix in _MJPEG_FRAME_EXTENSIONS
 
     # Define video codec options
     video_options = {}
@@ -646,15 +629,7 @@ def encode_video_frames(
         logging.getLogger("libav").setLevel(log_level)
 
     # Create and open output file (overwrite by default).
-    #
-    # BUGFIX(mp4-last-frame-dropped): PyAV hands libav packets with duration == 0, and the
-    # plain mp4 muxer needs the final sample's duration to build the sample table. For some
-    # frame counts it silently drops that last packet instead — reproduced on h264_nvmpi
-    # *and* libx264 at 40, 46 and 100 frames (41-45, 47, 99 are fine), which yields a video
-    # one frame shorter than the episode's parquet rows. The mp4 header still advertises the
-    # correct count, so only counting actual packets reveals it. A fragmented mp4 is
-    # self-describing per fragment, so nothing is dropped and timestamps stay exactly 1/fps
-    # apart. Unrelated to the conversion-speed work; see OPTIMIZATION_REPORT.md.
+
     output_options = {"movflags": "frag_keyframe+empty_moov"} if video_path.suffix == ".mp4" else None
     with av.open(str(video_path), "w", options=output_options) as output:
         output_stream = output.add_stream(vcodec, fps, options=video_options)
@@ -802,18 +777,6 @@ def concatenate_video_files(
     output video file. Packets are stream-copied (no re-encoding) and each input is shifted
     by an exact whole number of frame durations.
 
-    BUGFIX(concat-timestamp-drift): this used to hand the inputs to libav's concat demuxer,
-    which offsets each one by that input's *container duration*. That duration is only an
-    estimate for the final sample (PyAV cannot set ``AVPacket.duration``, so encoders leave
-    it at 0 and libav guesses), so each episode landed a few ticks late. The error
-    accumulates through ``videos/<key>/from_timestamp`` and immediately exceeded the
-    reader's ``tolerance_s``, making frames at an episode boundary unreadable:
-
-        FrameTimestampError: query timestamps violate the tolerance
-        (0.0007 > tolerance_s=0.0001); queried 74.1333, loaded 74.1340
-
-    Counting packets and stepping by exactly 1/fps is correct for the constant-rate video
-    LeRobot writes. Unrelated to the conversion-speed work; see OPTIMIZATION_REPORT.md.
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -869,10 +832,6 @@ def concatenate_video_files(
             with av.open(str(input_path)) as input_container:
                 input_stream = input_container.streams.video[0]
                 if output_stream is None:
-                    # BUGFIX(pyav10-add-stream-template): add_stream_from_template() is
-                    # PyAV >= 13 only. The Jetson l4t-tegra image ships PyAV 10, where the
-                    # template form is add_stream(template=...) — calling the former raised
-                    # AttributeError on any multi-episode conversion.
                     if hasattr(output_container, "add_stream_from_template"):
                         output_stream = output_container.add_stream_from_template(
                             template=input_stream, opaque=True
@@ -885,9 +844,6 @@ def concatenate_video_files(
                     rate = input_stream.average_rate or input_stream.base_rate
                     ticks_per_frame = int(round(float(1 / rate) / float(time_base)))
 
-                # BUGFIX(concat-timestamp-drift): shift this input by an exact whole number
-                # of frame durations rather than by its estimated container duration. See
-                # the docstring for why the concat demuxer cannot be used here.
                 base_dts = None
                 n_packets = 0
                 for packet in input_container.demux(input_stream):
