@@ -211,9 +211,7 @@ class DatasetWriter:
         self.episode_buffer["timestamp"].append(timestamp)
         self.episode_buffer["task"].append(frame.pop("task"))
 
-        # Start streaming encoder on first frame of episode, unless the caller already
-        # started it (an encoder that knows the whole episode up front can begin work
-        # before the buffer is filled).
+        # Start streaming encoder on first frame of episode
         if (
             frame_index == 0
             and self._streaming_encoder is not None
@@ -232,9 +230,7 @@ class DatasetWriter:
                 )
 
             if self._meta.features[key]["dtype"] == "video" and self._streaming_encoder is not None:
-                # Video goes to the encoder, not to disk: no per-frame image file is
-                # written and the buffer only needs a placeholder (video columns are
-                # not persisted to parquet).
+                # Video goes to the encoder, not to disk
                 self._streaming_encoder.feed_frame(key, frame[key])
                 self.episode_buffer[key].append(None)
             elif self._meta.features[key]["dtype"] in ["image", "video"]:
@@ -490,11 +486,8 @@ class DatasetWriter:
         hf_features = get_hf_features_from_features(self._meta.features)
         ep_dict = {key: episode_buffer[key] for key in hf_features}
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=hf_features, split="train")
-        # embed_images() is a row-by-row Dataset.map() used to inline image bytes into the
-        # table. With no `image` features there is nothing to inline, and the map still
-        # costs one Python call per frame (seconds per episode on long recordings).
         if self._meta.image_keys:
-            ep_dataset = embed_images(ep_dataset)
+            ep_dataset = embed_images(ep_dataset) #only needed when there are image features
         ep_num_frames = len(ep_dataset)
 
         if self._latest_episode is None:
@@ -565,11 +558,8 @@ class DatasetWriter:
             ep_path = temp_path
 
         ep_size_in_mb = get_file_size_in_mb(ep_path)
-        # BUGFIX(concat-timestamp-drift): exact frame_count / fps, not the container's
-        # duration estimate. This value is summed into to_timestamp / from_timestamp across
-        # episodes, so a per-episode rounding error here accumulates until reads near an
-        # episode boundary fail the reader's tolerance_s check. Was
-        # get_video_duration_in_s(ep_path).
+
+        # exact frame_count / fps, not the container's duration estimate. 
         ep_duration_in_s = get_exact_video_duration_in_s(ep_path, self._meta.fps)
 
         if (

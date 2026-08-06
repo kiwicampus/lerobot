@@ -1347,8 +1347,7 @@ def get_video_frame_count(video_path: Path | str) -> int:
 
     For the constant-frame-rate video LeRobot writes, one packet is one frame.
 
-    BUGFIX(mp4-last-frame-dropped) support: the mp4 header's advertised frame count can
-    disagree with how many packets the file actually holds, so callers that need to trust
+    The mp4 header's advertised frame count can disagree with how many packets the file actually holds, so callers that need to trust
     the length must count packets rather than read stream metadata.
     """
     with av.open(str(video_path)) as container:
@@ -1359,12 +1358,9 @@ def get_video_frame_count(video_path: Path | str) -> int:
 def get_exact_video_duration_in_s(video_path: Path | str, fps: int) -> float:
     """Return a video's duration as ``frame_count / fps``.
 
-    BUGFIX(concat-timestamp-drift): prefer this over :func:`get_video_duration_in_s` for
-    episode bookkeeping. The container's own duration is only an estimate for the final
+    The container's own duration is only an estimate for the final
     sample (PyAV cannot set ``AVPacket.duration``, so encoders leave it at 0 and libav
-    guesses). That error is summed into ``videos/<key>/to_timestamp`` /
-    ``from_timestamp`` across episodes until frames near an episode boundary fall outside
-    the reader's ``tolerance_s``.
+    guesses).
     """
     return get_video_frame_count(video_path) / float(fps)
 

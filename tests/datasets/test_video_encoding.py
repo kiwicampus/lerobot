@@ -482,22 +482,8 @@ class TestEncodeVideoFrames:
 
 
 class TestMp4HeaderDurationExactness:
-    """BUGFIX(mp4-last-frame-dropped): the mp4 header must not under-report duration.
-
-    PyAV cannot assign ``AVPacket.duration`` (read-only through at least PyAV 10), so
-    encoder packets reach libav with ``duration == 0``. Writing a fragmented mp4 stops
-    the muxer from *dropping* the final sample, but the header is still one frame short
-    whenever the final fragment holds a single packet: the muxer estimates a fragment's
-    last packet duration from the delta to the previous packet in that fragment, and a
-    single-packet fragment has no such delta.
-
-    With the default ``g=2`` keyframes land on every even frame index, so an odd frame
-    count puts the last frame (index N-1, even) on a keyframe and gives it a fragment of
-    its own. The odd counts below are the regression guard; the even ones prove the fix
-    did not regress the case that already worked.
-
-    ``TestEncodeVideoFrames.test_frame_count_and_duration_match_input`` allows 0.1 s of
-    slack -- three frames at 30 fps -- which is why it never caught this.
+    """
+    Check that the header duration is exactly the number of frames divided by fps, and that the muxer did not drop any frames.
     """
 
     WIDTH, HEIGHT = 256, 144
