@@ -70,7 +70,16 @@ def _encode_video_worker(
     camera_encoder: VideoEncoderConfig | None = None,
     encoder_threads: int | None = None,
     encode_kwargs: dict | None = None,
+    remove_images: bool = True,
 ) -> Path:
+    """Encode one camera's episode. Runs in a worker process.
+
+    Args:
+        remove_images: Delete the source frame directory when done. Must be False while
+            anything else still reads those frames: ``compute_episode_stats`` samples the
+            same files, and when it runs concurrently with this pool the parent takes over
+            the cleanup once both have finished.
+    """
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
@@ -83,7 +92,8 @@ def _encode_video_worker(
         overwrite=True,
         **(encode_kwargs or {}),
     )
-    shutil.rmtree(img_dir)
+    if remove_images:
+        shutil.rmtree(img_dir)
     return temp_path
 
 
@@ -369,57 +379,111 @@ class DatasetWriter:
             }
             non_video_features = {k: v for k, v in self._meta.features.items() if v["dtype"] != "video"}
             ep_stats = compute_episode_stats(non_video_buffer, non_video_features)
-        else:
-            ep_stats = compute_episode_stats(episode_buffer, self._meta.features)
 
-        ep_metadata = self._save_episode_data(episode_buffer)
+        # For video keys compute_episode_stats samples the frame files, a third pass over
+        # them after add_frame wrote them and before the encoders read them. Profiling put it
+        # at 7.4s of a 20s save_episode, fully serial, and it is why CPU sat at ~180% of
+        # 1200% while the encode pool had cores to spare. Running it alongside that pool
+        # hides the cost behind work already happening. The statistics are byte-identical:
+        # same function, same files, only the timing changes.
+        stats_future: concurrent.futures.Future | None = None
+        stats_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        defer_video_stats = (
+            not use_streaming
+            and has_video_keys
+            and not use_batched_encoding
+            and parallel_encoding
+            and len(self._meta.video_keys) > 1
+        )
 
-        if use_streaming:
-            streaming_results = self._streaming_encoder.finish_episode()
-            for video_key in self._meta.video_keys:
-                temp_path, video_stats = streaming_results[video_key]
-                if video_stats is not None:
-                    ep_stats[video_key] = {
-                        k: v if k == "count" else np.squeeze(v.reshape(1, -1, 1, 1) / 255.0, axis=0)
-                        for k, v in video_stats.items()
-                    }
-                ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
-        elif has_video_keys and not use_batched_encoding:
-            num_cameras = len(self._meta.video_keys)
-            if parallel_encoding and num_cameras > 1:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
-                    future_to_key = {}
-                    for video_key in self._meta.video_keys:
-                        future = executor.submit(
-                            _encode_video_worker,
-                            video_key,
-                            episode_index,
-                            self._root,
-                            self._meta.fps,
-                            self._camera_encoder,
-                            self._encoder_threads,
-                            self._resolve_video_encoding_kwargs(video_key),
-                        )
-                        future_to_key[future] = video_key
-
-                    results = {}
-                    for future in concurrent.futures.as_completed(future_to_key):
-                        video_key = future_to_key[future]
-                        try:
-                            temp_path = future.result()
-                            results[video_key] = temp_path
-                        except Exception as exc:
-                            logger.error(f"Video encoding failed for {video_key}: {exc}")
-                            raise exc
-
-                for video_key in self._meta.video_keys:
-                    temp_path = results[video_key]
-                    ep_metadata.update(
-                        self._save_episode_video(video_key, episode_index, temp_path=temp_path)
-                    )
+        if not use_streaming:
+            if defer_video_stats:
+                video_keys = set(self._meta.video_keys)
+                ep_stats = compute_episode_stats(
+                    {k: v for k, v in episode_buffer.items() if k not in video_keys},
+                    {k: v for k, v in self._meta.features.items() if k not in video_keys},
+                )
+                # A thread rather than a process: the work is PIL decode plus numpy
+                # reductions, both of which release the GIL, and a thread avoids pickling
+                # the frame paths and the resulting arrays.
+                stats_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                stats_future = stats_pool.submit(
+                    compute_episode_stats,
+                    {k: episode_buffer[k] for k in self._meta.video_keys},
+                    {k: self._meta.features[k] for k in self._meta.video_keys},
+                )
             else:
+                ep_stats = compute_episode_stats(episode_buffer, self._meta.features)
+
+        # The frame files now have two readers -- this pool and the deferred statistics
+        # thread -- so neither can own their deletion, and _encode_video_worker was told to
+        # leave them alone. That makes cleanup this scope's responsibility on *every* exit:
+        # a failing encoder used to leak only its own camera's frames, and without the
+        # finally it would now leak all of them, once per failed episode.
+        try:
+            ep_metadata = self._save_episode_data(episode_buffer)
+
+            if use_streaming:
+                streaming_results = self._streaming_encoder.finish_episode()
                 for video_key in self._meta.video_keys:
-                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
+                    temp_path, video_stats = streaming_results[video_key]
+                    if video_stats is not None:
+                        ep_stats[video_key] = {
+                            k: v if k == "count" else np.squeeze(v.reshape(1, -1, 1, 1) / 255.0, axis=0)
+                            for k, v in video_stats.items()
+                        }
+                    ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
+            elif has_video_keys and not use_batched_encoding:
+                num_cameras = len(self._meta.video_keys)
+                if parallel_encoding and num_cameras > 1:
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
+                        future_to_key = {}
+                        for video_key in self._meta.video_keys:
+                            future = executor.submit(
+                                _encode_video_worker,
+                                video_key,
+                                episode_index,
+                                self._root,
+                                self._meta.fps,
+                                self._camera_encoder,
+                                self._encoder_threads,
+                                self._resolve_video_encoding_kwargs(video_key),
+                                # The deferred stats thread is still sampling these frames; the
+                                # parent removes them once both readers are done.
+                                not defer_video_stats,
+                            )
+                            future_to_key[future] = video_key
+
+                        results = {}
+                        for future in concurrent.futures.as_completed(future_to_key):
+                            video_key = future_to_key[future]
+                            try:
+                                temp_path = future.result()
+                                results[video_key] = temp_path
+                            except Exception as exc:
+                                logger.error(f"Video encoding failed for {video_key}: {exc}")
+                                raise exc
+
+                    for video_key in self._meta.video_keys:
+                        temp_path = results[video_key]
+                        ep_metadata.update(
+                            self._save_episode_video(video_key, episode_index, temp_path=temp_path)
+                        )
+                else:
+                    for video_key in self._meta.video_keys:
+                        ep_metadata.update(self._save_episode_video(video_key, episode_index))
+
+            if stats_future is not None:
+                ep_stats.update(stats_future.result())
+        finally:
+            if stats_pool is not None:
+                stats_pool.shutdown(wait=True)
+            if defer_video_stats:
+                for video_key in self._meta.video_keys:
+                    shutil.rmtree(
+                        self._get_image_file_dir(episode_index, video_key),
+                        ignore_errors=True,
+                    )
 
         # `meta.save_episode` need to be executed after encoding the videos
         self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
