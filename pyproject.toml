@@ -63,7 +63,7 @@ dependencies = [
     # Core ML
     "torch>=2.7,<2.12.0",
     "torchvision>=0.22.0,<0.27.0",
-    "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
+    "numpy>=1.26.0,<2.0.0", # NOTE: Capped <2.0 for ROS 2 Jazzy cv_bridge ABI compat (compiled against NumPy 1.x; robots run ROS + lerobot in the same interpreter).
     "opencv-python-headless>=4.9.0,<4.14.0",
     "Pillow>=10.0.0,<13.0.0",
     "einops>=0.8.0,<0.9.0",
@@ -271,9 +271,11 @@ metaworld = ["lerobot[dataset]", "metaworld==3.0.0", "lerobot[scipy-dep]"]
 # release), so any `vlabench>=X` pip spec is unresolvable. Install it
 # manually alongside MuJoCo / dm-control — see docs/source/vlabench.mdx
 # for the recipe.
-# NOTE: robomme is NOT a pyproject extra — mani-skill hard-pins numpy<2
-# which conflicts with lerobot's numpy>=2 base pin, so the two trees can't
-# resolve into a single env. Install it only in the RoboMME Docker image
+# NOTE: robomme is NOT a pyproject extra — mani-skill hard-pins numpy<2.
+# This fork's own base pin is also numpy<2.0 (see above, for ROS cv_bridge
+# compat), so this specific clash may no longer apply upstream's original
+# reasoning — unverified, revisit if robomme's resolution actually works
+# standalone now. Until then, install it only in the RoboMME Docker image
 # via `uv pip install --override` (see docker/Dockerfile.benchmark.robomme).
 # NOTE: robocasa is NOT exposed as a `lerobot` extra. Its setup.py pins
 # `lerobot==0.3.3` in install_requires, which cyclically shadows our own
