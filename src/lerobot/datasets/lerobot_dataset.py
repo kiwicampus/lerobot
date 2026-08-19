@@ -705,6 +705,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         data_files_size_in_mb: int | None = None,
         vcodec: str | None = None,
         encoding_kwargs: dict | None = None,
+        streaming_encoder: "StreamingVideoEncoder | None" = None,
     ) -> "LeRobotDataset":
         """Create a new LeRobotDataset from scratch for recording data.
 
@@ -739,6 +740,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 during capture instead of writing images first.
             encoder_queue_maxsize: Max buffered frames per camera when using
                 streaming encoding.
+            streaming_encoder: Pre-built streaming encoder to use instead of building
+                one from ``streaming_encoding``. Any object exposing
+                ``start_episode`` / ``feed_frame`` / ``finish_episode`` /
+                ``cancel_episode`` / ``close`` works; offline converters use this to
+                supply an encoder that reads source frames directly rather than
+                receiving them through the recording loop.
 
         Returns:
             A new :class:`LeRobotDataset` in write mode.
@@ -778,8 +785,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             _crf = _kwargs.pop("crf", 30)
             camera_encoder = VideoEncoderConfig(vcodec=_vcodec, pix_fmt=_pix_fmt, crf=_crf)
 
-        streaming_enc = None
-        if streaming_encoding and len(obj.meta.video_keys) > 0:
+        streaming_enc = streaming_encoder
+        if streaming_enc is None and streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
                 fps, camera_encoder, encoder_queue_maxsize, encoder_threads
             )

@@ -46,6 +46,76 @@ from lerobot.utils.import_utils import get_safe_default_video_backend
 
 SUPPORTED_FRAME_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif")
 
+_MJPEG_FRAME_EXTENSIONS = ("jpg", "jpeg") # Frame extensions supported by libav's mjpeg decoder, to avoid unnecessary color conversions.
+
+
+def _read_frame_bytes_ahead(paths: list[str], read_ahead: int = 8):
+    """Yield file contents for ``paths`` in order, reading ahead in a helper thread.
+    """
+    if read_ahead <= 0:
+        for path in paths:
+            with open(path, "rb") as fh:
+                yield fh.read()
+        return
+
+    out_queue: queue.Queue = queue.Queue(maxsize=read_ahead)
+    sentinel = object()
+
+    def _reader() -> None:
+        try:
+            for path in paths:
+                with open(path, "rb") as fh:
+                    out_queue.put(fh.read())
+        except Exception as exc:  # surfaced to the consumer below
+            out_queue.put(exc)
+        else:
+            out_queue.put(sentinel)
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    while True:
+        item = out_queue.get()
+        if item is sentinel:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+def _prepare_frame_for_encoder(
+    frame: av.VideoFrame, pix_fmt: str, width: int, height: int
+) -> av.VideoFrame:
+    """Convert ``frame`` to the encoder's pixel format / size, skipping no-op conversions.
+
+    JPEG decodes to the full-range ``yuvj420p``; the explicit reformat to ``yuv420p`` is
+    what applies the full -> limited range scaling (the same scaling the old
+    RGB -> YUV path applied), so it must not be skipped.
+    """
+    if frame.width != width or frame.height != height:
+        return frame.reformat(width=width, height=height, format=pix_fmt)
+    if frame.format.name != pix_fmt:
+        return frame.reformat(format=pix_fmt)
+    return frame
+
+
+def _iter_encoder_frames(
+    input_list: list[str], suffix: str, pix_fmt: str, width: int, height: int, use_mjpeg: bool
+):
+    """Yield encoder-ready :class:`av.VideoFrame` objects for the given frame files."""
+    if use_mjpeg:
+        codec_ctx = av.CodecContext.create("mjpeg", "r")
+        for data in _read_frame_bytes_ahead(input_list):
+            for frame in codec_ctx.decode(av.Packet(data)):
+                yield _prepare_frame_for_encoder(frame, pix_fmt, width, height)
+        return
+
+    for input_data in input_list:
+        with Image.open(input_data) as input_image:
+            input_image = input_image.convert("RGB")
+            if input_image.size != (width, height):
+                input_image = input_image.resize((width, height), Image.NEAREST)
+            yield av.VideoFrame.from_image(input_image)
+
 logger = logging.getLogger(__name__)
 
 def get_safe_default_codec():
@@ -497,6 +567,7 @@ def encode_video_frames(
 
     # Get input frames. Search in priority order: jpg first (byte passthrough path), then others.
     input_list = []
+    frame_suffix = ""
     for suffix in SUPPORTED_FRAME_EXTENSIONS:
         template = "frame-" + ("[0-9]" * 6) + f".{suffix}"
         input_list = sorted(
@@ -504,6 +575,7 @@ def encode_video_frames(
             key=lambda x: int(Path(x).stem.split("-")[-1]),
         )
         if input_list:
+            frame_suffix = suffix
             break
 
     if len(input_list) == 0:
@@ -513,6 +585,8 @@ def encode_video_frames(
     else:
         with Image.open(input_list[0]) as dummy_image:
             width, height = dummy_image.size
+
+    use_mjpeg = frame_suffix in _MJPEG_FRAME_EXTENSIONS
 
     # Define video codec options
     video_options = {}
@@ -554,23 +628,22 @@ def encode_video_frames(
         # "While less efficient, it is generally preferable to modify logging with Python's logging"
         logging.getLogger("libav").setLevel(log_level)
 
-    # Create and open output file (overwrite by default)
-    with av.open(str(video_path), "w") as output:
+    # Create and open output file (overwrite by default).
+
+    output_options = {"movflags": "frag_keyframe+empty_moov"} if video_path.suffix == ".mp4" else None
+    with av.open(str(video_path), "w", options=output_options) as output:
         output_stream = output.add_stream(vcodec, fps, options=video_options)
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width
         output_stream.height = height
 
         # Loop through input frames and encode them
-        for frame_idx, input_data in enumerate(input_list):
-            with Image.open(input_data) as input_image:
-                input_image = input_image.convert("RGB")
-                if target_size is not None:
-                    input_image = input_image.resize((width, height), Image.NEAREST)
-                input_frame = av.VideoFrame.from_image(input_image)
-                packet = output_stream.encode(input_frame)
-                if packet:
-                    output.mux(packet)
+        for input_frame in _iter_encoder_frames(
+            input_list, frame_suffix, pix_fmt, width, height, use_mjpeg
+        ):
+            packet = output_stream.encode(input_frame)
+            if packet:
+                output.mux(packet)
 
         # Flush the encoder
         packet = output_stream.encode()
@@ -583,6 +656,11 @@ def encode_video_frames(
 
     if not video_path.exists():
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
+
+    # read back through a demuxer so that the final packet carries an explicit
+    # duration and the destination muxer never has to estimate. 
+    if video_path.suffix == ".mp4":
+        concatenate_video_files([video_path], video_path, overwrite=True)
 
 
 def reencode_video(
@@ -701,8 +779,9 @@ def concatenate_video_files(
     Concatenate multiple video files into a single video file using pyav.
 
     This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
+    output video file. Packets are stream-copied (no re-encoding) and each input is shifted
+    by an exact whole number of frame durations.
+
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -711,9 +790,9 @@ def concatenate_video_files(
         compatibility_check: Whether to check if the input videos are compatible. Default is False.
 
     Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+        - All inputs must share codec, resolution and frame rate.
+        - Relative PTS/DTS within an input are preserved, so this stays correct for streams
+          with B-frames.
     """
 
     output_video_path = Path(output_video_path)
@@ -743,55 +822,60 @@ def concatenate_video_files(
                     f"Input video {input_path} is not compatible with the reference video {input_video_paths[0]}."
                 )
 
-    # Create a temporary .ffconcat file to list the input video paths
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
-        tmp_concatenate_file.write("ffconcat version 1.0\n")
-        for input_path in input_video_paths:
-            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
-        tmp_concatenate_file.flush()
-        tmp_concatenate_path = tmp_concatenate_file.name
-
-    # Create input and output containers
-    input_container = av.open(
-        tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
-
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+    # faststart moves the metadata to the beginning of the file to speed up loading
+    output_container = av.open(tmp_output_video_path, mode="w", options={"movflags": "faststart"})
 
-    # Replicate input streams in output container
-    stream_map = {}
-    for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
-            )
+    output_stream = None
+    time_base = None
+    ticks_per_frame = 0
+    ticks_offset = 0
+    try:
+        for input_path in input_video_paths:
+            with av.open(str(input_path)) as input_container:
+                input_stream = input_container.streams.video[0]
+                if output_stream is None:
+                    if hasattr(output_container, "add_stream_from_template"):
+                        output_stream = output_container.add_stream_from_template(
+                            template=input_stream, opaque=True
+                        )
+                    else:
+                        output_stream = output_container.add_stream(template=input_stream)
+                    # time base is missing in the codec context
+                    time_base = input_stream.time_base
+                    output_stream.time_base = time_base
+                    # prefer base_rate. average_rate is frames / header-duration *problematic on a fragmented mp4)
+                    rate = input_stream.base_rate or input_stream.average_rate
+                    ticks_per_frame = int(round(float(1 / rate) / float(time_base)))
 
-            # set the time base to the input stream time base (missing in the codec context)
-            stream_map[input_stream.index].time_base = input_stream.time_base
+                base_dts = None
+                n_packets = 0
+                max_dts = None
+                for packet in input_container.demux(input_stream):
+                    if packet.dts is None:  # demuxer flush packet
+                        continue
+                    if base_dts is None:
+                        base_dts = packet.dts
+                    packet.stream = output_stream
+                    packet.dts = packet.dts - base_dts + ticks_offset
+                    if packet.pts is not None:
+                        packet.pts = packet.pts - base_dts + ticks_offset
+                    max_dts = packet.dts if max_dts is None else max(max_dts, packet.dts)
+                    output_container.mux(packet)
+                    n_packets += 1
 
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
+                # advance past whichever is later, the nominal end or one frame past the highest dts  
+                nominal_end = ticks_offset + n_packets * ticks_per_frame
+                if max_dts is None:
+                    ticks_offset = nominal_end
+                else:
+                    ticks_offset = max(nominal_end, max_dts + ticks_per_frame)
+    finally:
+        output_container.close()
 
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
-
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
     shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
 
 
 class _CameraEncoderThread(threading.Thread):
@@ -953,6 +1037,11 @@ class StreamingVideoEncoder:
         self._dropped_frames: dict[str, int] = {}
         self._episode_active = False
         self._closed = False
+
+    @property
+    def episode_active(self) -> bool:
+        """Whether an episode is currently being encoded."""
+        return self._episode_active
 
     def start_episode(self, video_keys: list[str], temp_dir: Path) -> None:
         """Start encoder threads for a new episode.
@@ -1251,6 +1340,29 @@ def get_video_pixel_channels(pix_fmt: str) -> int:
         return 3
     else:
         raise ValueError("Unknown format")
+
+
+def get_video_frame_count(video_path: Path | str) -> int:
+    """Return the number of video packets in ``video_path`` (demux only, no decoding).
+
+    For the constant-frame-rate video LeRobot writes, one packet is one frame.
+
+    The mp4 header's advertised frame count can disagree with how many packets the file actually holds, so callers that need to trust
+    the length must count packets rather than read stream metadata.
+    """
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        return sum(1 for packet in container.demux(stream) if packet.dts is not None)
+
+
+def get_exact_video_duration_in_s(video_path: Path | str, fps: int) -> float:
+    """Return a video's duration as ``frame_count / fps``.
+
+    The container's own duration is only an estimate for the final
+    sample (PyAV cannot set ``AVPacket.duration``, so encoders leave it at 0 and libav
+    guesses).
+    """
+    return get_video_frame_count(video_path) / float(fps)
 
 
 def get_video_duration_in_s(video_path: Path | str) -> float:

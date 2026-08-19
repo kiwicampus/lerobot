@@ -35,6 +35,8 @@ HW_VIDEO_CODECS = [
     "hevc_nvenc",  # NVIDIA GPU
     "h264_vaapi",  # Linux Intel/AMD
     "h264_qsv",  # Intel Quick Sync
+    "h264_nvmpi",  # NVIDIA Jetson (Tegra multimedia API, via jetson-ffmpeg)
+    "hevc_nvmpi",  # NVIDIA Jetson (Tegra multimedia API, via jetson-ffmpeg)
 ]
 VALID_VIDEO_CODECS: frozenset[str] = frozenset({"h264", "hevc", "libsvtav1", "auto", *HW_VIDEO_CODECS})
 # Aliases for legacy video codec names.
@@ -218,6 +220,10 @@ class VideoEncoderConfig:
         elif self.vcodec == "h264_qsv":
             set_if("global_quality", self.crf)
             set_if("preset", self.preset)
+        elif self.vcodec in ("h264_nvmpi", "hevc_nvmpi"):
+            # Jetson nvmpi has no CRF/rate-control-quality mode - bitrate only.
+            # "8M" matches the previous default (encode_video_frames' bitrate=).
+            opts["b"] = "8M"
         else:
             set_if("crf", self.crf)
             set_if("preset", self.preset)
