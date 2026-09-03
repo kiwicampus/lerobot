@@ -695,6 +695,16 @@ def update_meta_data(
     df["meta/episodes/file_index"] = df["meta/episodes/file_index"] + meta_idx["file"]
     df["data/chunk_index"] = df["data/chunk_index"] + data_idx["chunk"]
     df["data/file_index"] = df["data/file_index"] + data_idx["file"]
+    # LOCAL-FIX(timestamp-dtype): per-episode source datasets store
+    # ``videos/*/from_timestamp`` as int64 (the writer emits the int 0 for a
+    # dataset's first episode). ``df.at[i, col] += 21.4`` on an int64 column
+    # floors to 21 silently, which shifted every merged episode's video start
+    # by up to a second (2026-09-02 incident). Offsets are seconds; the
+    # columns must be float64 before any arithmetic below.
+    for key in videos_idx:
+        for col in (f"videos/{key}/from_timestamp", f"videos/{key}/to_timestamp"):
+            if col in df.columns:
+                df[col] = df[col].astype("float64")
     for key, video_idx in videos_idx.items():
         # CONFLICT RESOLUTION (cherry-pick 90684a96 on top of local 96516e34):
         # Upstream's vectorized rewrite of this loop drops the per-source-file
@@ -1228,6 +1238,31 @@ def _parq_finalize_all() -> None:
     _PARQ_WRITERS.clear()
 
 
+def _normalize_timestamp_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ``df`` with every ``videos/*/{from,to}_timestamp`` column as float64.
+
+    LOCAL-FIX(timestamp-dtype): the streaming writer pins the schema of the
+    first table it sees and casts later tables to it with ``safe=False``. If
+    that first source carried an int64 ``from_timestamp`` (see
+    ``update_meta_data``), every later float offset was floored on write.
+    Normalising the timestamp columns up front — on the DataFrame, so the
+    parquet's pandas metadata agrees with the arrow schema — makes the pinned
+    schema float regardless of which source arrives first.
+    """
+    cols = [
+        c
+        for c in df.columns
+        if c.startswith("videos/") and (c.endswith("/from_timestamp") or c.endswith("/to_timestamp"))
+        and not pd.api.types.is_float_dtype(df[c])
+    ]
+    if not cols:
+        return df
+    df = df.copy()
+    for c in cols:
+        df[c] = df[c].astype("float64")
+    return df
+
+
 def _append_or_create_parquet_file_streaming(
     df: pd.DataFrame,
     src_path: Path,
@@ -1245,7 +1280,9 @@ def _append_or_create_parquet_file_streaming(
     exceed max_mb, closes the current writer and opens a new one at
     the rotated (chunk, file) index.
     """
-    table = _parq_pa.Table.from_pandas(df, preserve_index=False)
+    table = _parq_pa.Table.from_pandas(
+        _normalize_timestamp_columns(df), preserve_index=False
+    )
     src_size_mb = get_parquet_file_size_in_mb(src_path)
 
     dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
