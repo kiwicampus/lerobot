@@ -334,6 +334,11 @@ class EditDatasetConfig:
     new_root: str | None = None
     # Upload dataset to Hugging Face hub.
     push_to_hub: bool = False
+    # Output sizing for the merge operation, passed through to aggregate_datasets.
+    # None keeps the aggregate_datasets defaults.
+    data_files_size_in_mb: float | None = None
+    video_files_size_in_mb: float | None = None
+    chunk_size: int | None = None
 
 
 def _resolve_io_paths(
@@ -474,6 +479,9 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
         output_dir=output_dir,
         concatenate_videos=cfg.operation.concatenate_videos,
         concatenate_data=cfg.operation.concatenate_data,
+        data_files_size_in_mb=cfg.data_files_size_in_mb,
+        video_files_size_in_mb=cfg.video_files_size_in_mb,
+        chunk_size=cfg.chunk_size,
     )
 
     logging.info(f"Merged dataset saved to {output_dir}")

@@ -15,13 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import logging
+import os
 import shutil
+import subprocess
+import tempfile
+import time
+from concurrent import futures
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import datasets
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import tqdm
 
 from lerobot.configs import VIDEO_ENCODER_INFO_KEYS
@@ -48,6 +57,485 @@ from .utils import (
     update_chunk_file_indices,
 )
 from .video_utils import concatenate_video_files, get_video_duration_in_s
+
+
+class IncompatibleSourceError(ValueError):
+    """Raised by plan_video_shards() when sources for a camera disagree on
+    codec / pix_fmt / resolution / fps. Aborts the merge before any I/O."""
+
+
+@dataclass(frozen=True)
+class SourceEntry:
+    src_path: Path
+    src_chunk: int
+    src_file: int
+    src_size_bytes: int
+    src_duration_s: float
+    offset_in_dst_s: float
+
+
+@dataclass
+class ShardPlan:
+    key: str
+    dst_chunk: int
+    dst_file: int
+    dst_path: Path
+    sources: list = field(default_factory=list)  # list[SourceEntry]
+
+    @property
+    def total_size_bytes(self) -> int:
+        return sum(s.src_size_bytes for s in self.sources)
+
+    @property
+    def total_duration_s(self) -> float:
+        return sum(s.src_duration_s for s in self.sources)
+
+
+def _pvp_unique_src_pairs(src_meta, key) -> list[tuple[int, int]]:
+    """Sorted unique (chunk, file) pairs for `key` in this source's episodes
+    metadata. Same logic the online aggregate_videos uses."""
+    return sorted(
+        {
+            (chunk, file)
+            for chunk, file in zip(
+                src_meta.episodes[f"videos/{key}/chunk_index"],
+                src_meta.episodes[f"videos/{key}/file_index"],
+                strict=False,
+            )
+        }
+    )
+
+
+def _pvp_validate_camera_consistency(all_metadata, key: str) -> None:
+    """All source datasets must agree on codec / pix_fmt / resolution / fps
+    for the given camera, otherwise ffmpeg -c copy concat will fail at
+    runtime. We catch this up-front so the merge aborts cleanly."""
+    if not all_metadata:
+        return
+    ref_feat = all_metadata[0].features.get(key)
+    if ref_feat is None:
+        raise IncompatibleSourceError(f"camera '{key}' missing from first source's features")
+    ref_info = ref_feat.get("info", {}) or {}
+    ref_shape = ref_feat.get("shape")
+    keys_to_check = ("video.codec", "video.pix_fmt", "video.fps", "video.height", "video.width")
+    for src_meta in all_metadata[1:]:
+        f = src_meta.features.get(key)
+        if f is None:
+            raise IncompatibleSourceError(f"camera '{key}' missing from source {src_meta.repo_id}")
+        info = f.get("info", {}) or {}
+        if f.get("shape") != ref_shape:
+            raise IncompatibleSourceError(
+                f"camera '{key}' shape mismatch: ref={ref_shape} vs {src_meta.repo_id}={f.get('shape')}"
+            )
+        for k in keys_to_check:
+            if info.get(k) != ref_info.get(k):
+                raise IncompatibleSourceError(
+                    f"camera '{key}' {k} mismatch: ref={ref_info.get(k)} vs {src_meta.repo_id}={info.get(k)}"
+                )
+
+
+def plan_video_shards(
+    all_metadata,
+    aggr_root: Path,
+    video_keys: list[str],
+    video_files_size_in_mb: float,
+    chunk_size: int,
+) -> tuple[dict, dict]:
+    """Compute the full destination-shard plan for every camera + a per-source
+    videos_idx view that aggregate_metadata() can consume without re-touching
+    file state.
+
+    Returns:
+      plan:            {camera_key: [ShardPlan, ...]} in shard order
+      per_source_view: {src_repo_id: {camera_key: videos_idx_dict}}
+
+    `per_source_view[r][k]` matches the shape `aggregate_videos()` produces
+    today, with one twist: `episode_duration` is pre-set to 0 so the existing
+    `latest_duration += episode_duration` mutation in `aggregate_metadata()`
+    becomes a no-op. The cumulative duration before this source's first src
+    is recorded as `latest_duration` directly.
+    """
+    size_cap_bytes = int(video_files_size_in_mb * 1024 * 1024)
+    plan: dict[str, list[ShardPlan]] = {}
+    # per_source_view: src_repo_id -> {key: {chunk, file, latest_duration,
+    # episode_duration, src_to_offset}}
+    per_source_view: dict[str, dict[str, dict]] = {}
+
+    # We need to enumerate sources in the same order aggregate_datasets() does
+    # so the resulting layout matches one-for-one. Source order is the order
+    # of `all_metadata`; within a source, the (chunk, file) pairs are sorted.
+    for src_meta in all_metadata:
+        per_source_view.setdefault(src_meta.repo_id, {})
+
+    for key in video_keys:
+        _pvp_validate_camera_consistency(all_metadata, key)
+        shards: list[ShardPlan] = []
+        chunk_idx = 0
+        file_idx = 0
+        # Running estimates of the current (still-open) destination shard.
+        dst_size_estimate_bytes = 0
+        dst_duration_estimate_s = 0.0
+        current_shard: ShardPlan | None = None
+
+        for src_meta in all_metadata:
+            # Per-source view starts fresh; will be filled below.
+            src_view = {
+                "chunk": chunk_idx,
+                "file": file_idx,
+                "latest_duration": dst_duration_estimate_s
+                if current_shard is not None and current_shard.sources
+                else 0.0,
+                "episode_duration": 0.0,  # see "contract trick" in design doc
+                "src_to_offset": {},
+            }
+            # Track what we record into the view per (src_chunk, src_file).
+            last_dst_chunk = chunk_idx
+            last_dst_file = file_idx
+
+            for src_chunk, src_file in _pvp_unique_src_pairs(src_meta, key):
+                src_path = src_meta.root / DEFAULT_VIDEO_PATH.format(
+                    video_key=key,
+                    chunk_index=src_chunk,
+                    file_index=src_file,
+                )
+                if not src_path.is_file():
+                    raise FileNotFoundError(
+                        f"missing source mp4: {src_path} (camera={key}, src_meta={src_meta.repo_id})"
+                    )
+                src_size_bytes = src_path.stat().st_size
+                src_duration_s = float(get_video_duration_in_s(src_path))
+
+                # Decide: first-in-shard, rotate, or append.
+                if current_shard is None or not current_shard.sources:
+                    # First src ever for this camera (or empty shard after rotate).
+                    if current_shard is None:
+                        current_shard = ShardPlan(
+                            key=key,
+                            dst_chunk=chunk_idx,
+                            dst_file=file_idx,
+                            dst_path=aggr_root
+                            / DEFAULT_VIDEO_PATH.format(
+                                video_key=key,
+                                chunk_index=chunk_idx,
+                                file_index=file_idx,
+                            ),
+                        )
+                    offset_in_dst_s = 0.0
+                    dst_size_estimate_bytes = src_size_bytes
+                    dst_duration_estimate_s = src_duration_s
+                elif dst_size_estimate_bytes + src_size_bytes >= size_cap_bytes:
+                    # Rotate: close current shard, start a new one.
+                    shards.append(current_shard)
+                    chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, chunk_size)
+                    current_shard = ShardPlan(
+                        key=key,
+                        dst_chunk=chunk_idx,
+                        dst_file=file_idx,
+                        dst_path=aggr_root
+                        / DEFAULT_VIDEO_PATH.format(
+                            video_key=key,
+                            chunk_index=chunk_idx,
+                            file_index=file_idx,
+                        ),
+                    )
+                    offset_in_dst_s = 0.0
+                    dst_size_estimate_bytes = src_size_bytes
+                    dst_duration_estimate_s = src_duration_s
+                else:
+                    # Append to the current open shard.
+                    offset_in_dst_s = dst_duration_estimate_s
+                    dst_size_estimate_bytes += src_size_bytes
+                    dst_duration_estimate_s += src_duration_s
+
+                current_shard.sources.append(
+                    SourceEntry(
+                        src_path=src_path,
+                        src_chunk=src_chunk,
+                        src_file=src_file,
+                        src_size_bytes=src_size_bytes,
+                        src_duration_s=src_duration_s,
+                        offset_in_dst_s=offset_in_dst_s,
+                    )
+                )
+
+                # Record per-source-file destination + offset for update_meta_data().
+                src_view["src_to_offset"][(src_chunk, src_file)] = offset_in_dst_s
+                last_dst_chunk = current_shard.dst_chunk
+                last_dst_file = current_shard.dst_file
+
+            # After all src files for this source, record where they ended up.
+            src_view["chunk"] = last_dst_chunk
+            src_view["file"] = last_dst_file
+            per_source_view[src_meta.repo_id][key] = src_view
+
+        # Flush the still-open shard at end-of-camera.
+        if current_shard is not None and current_shard.sources:
+            shards.append(current_shard)
+        plan[key] = shards
+
+    # Sanity: every (key, dst_chunk, dst_file) is unique across the plan.
+    seen: set[tuple[str, int, int]] = set()
+    for key, shards in plan.items():
+        for s in shards:
+            tup = (key, s.dst_chunk, s.dst_file)
+            if tup in seen:
+                raise AssertionError(f"duplicate shard key in plan: {tup} — planner bug")
+            seen.add(tup)
+
+    return plan, per_source_view
+
+
+# ─────── Stage B: executor (runs each ShardPlan to disk) ───────
+
+
+@dataclass(frozen=True)
+class ShardResult:
+    ok: bool
+    detail: str = ""
+    wall_s: float = 0.0
+    bytes_written: int = 0
+    method: str = ""  # "copy" or "ffmpeg"
+
+
+class ShardExecutionError(RuntimeError):
+    """Raised by execute_video_plan() when one or more shards fail."""
+
+
+def _pvp_use_planned_videos() -> bool:
+    """Read LEROBOT_AGGREGATE_VIDEO_PLAN at call time. Default False.
+    When True, aggregate_datasets() runs Stages A+B (plan + parallel
+    execute) before the per-source loop, instead of calling
+    aggregate_videos() per source. The existing online path remains
+    the fallback when this is False."""
+    raw = os.environ.get("LEROBOT_AGGREGATE_VIDEO_PLAN", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _pvp_workers_env() -> int:
+    """Read LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS at call time. Default
+    min(8, cpu_count()) capped at 1+."""
+    raw = os.environ.get("LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return min(8, os.cpu_count() or 4)
+
+
+def _pvp_timeout_env() -> float:
+    """Read LEROBOT_AGGREGATE_VIDEO_PLAN_TIMEOUT_S at call time. Default 1200."""
+    raw = os.environ.get("LEROBOT_AGGREGATE_VIDEO_PLAN_TIMEOUT_S")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return 1200.0
+
+
+def _execute_shard(shard: ShardPlan) -> ShardResult:
+    """Materialize one ShardPlan to disk.
+
+    Single-source shards use shutil.copy (byte-identical, no re-mux).
+    Multi-source shards use one ffmpeg subprocess with `-f concat -c copy`.
+    Output writes are atomic: ffmpeg writes to a sibling temp file which
+    is moved to the final path on success; failures clean up the temp.
+
+    This function is pickled to ProcessPoolExecutor workers, so all of its
+    imports come from the module-level prologue (subprocess, tempfile via
+    subprocess / tempfile). The function is intentionally pure
+    of any non-picklable closure state.
+    """
+    t0 = time.monotonic()
+
+    if not shard.sources:
+        return ShardResult(ok=False, detail="empty source list", wall_s=0.0)
+
+    shard.dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Single-source fast path: byte-identical with shutil.copy
+    if len(shard.sources) == 1:
+        try:
+            shutil.copy(str(shard.sources[0].src_path), str(shard.dst_path))
+        except Exception as exc:  # noqa: BLE001
+            return ShardResult(
+                ok=False,
+                detail=f"copy failed: {exc!r}",
+                wall_s=time.monotonic() - t0,
+                method="copy",
+            )
+        return ShardResult(
+            ok=True,
+            method="copy",
+            wall_s=time.monotonic() - t0,
+            bytes_written=shard.dst_path.stat().st_size,
+        )
+
+    # Multi-source: ffmpeg concat demuxer with stream-copy
+    list_path = None
+    tmp_dst = shard.dst_path.with_suffix(".mp4.tmp")
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            suffix=".ffconcat",
+            delete=False,
+            dir=str(shard.dst_path.parent),
+        ) as f:
+            f.write("ffconcat version 1.0\n")
+            for src in shard.sources:
+                f.write(f"file '{src.src_path.resolve()}'\n")
+            list_path = f.name
+
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-c",
+                "copy",
+                "-movflags",
+                "faststart",
+                "-f",
+                "mp4",  # force muxer; tmp suffix is .mp4.tmp
+                str(tmp_dst),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_pvp_timeout_env(),
+        )
+        if proc.returncode != 0:
+            return ShardResult(
+                ok=False,
+                detail=f"ffmpeg rc={proc.returncode}: {proc.stderr[-2000:]}",
+                wall_s=time.monotonic() - t0,
+                method="ffmpeg",
+            )
+        shutil.move(str(tmp_dst), str(shard.dst_path))
+        return ShardResult(
+            ok=True,
+            method="ffmpeg",
+            wall_s=time.monotonic() - t0,
+            bytes_written=shard.dst_path.stat().st_size,
+        )
+    except subprocess.TimeoutExpired:
+        return ShardResult(
+            ok=False,
+            detail=f"ffmpeg timed out after {_pvp_timeout_env()}s",
+            wall_s=time.monotonic() - t0,
+            method="ffmpeg",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ShardResult(
+            ok=False,
+            detail=f"ffmpeg invocation failed: {exc!r}",
+            wall_s=time.monotonic() - t0,
+            method="ffmpeg",
+        )
+    finally:
+        if list_path is not None:
+            Path(list_path).unlink(missing_ok=True)
+        if tmp_dst.exists():
+            tmp_dst.unlink(missing_ok=True)
+
+
+def execute_video_plan(plan: dict, max_workers: int | None = None) -> dict:
+    """Run every ShardPlan in `plan` to produce the output mp4s.
+
+    Args:
+      plan:        {camera_key: [ShardPlan, ...]} from plan_video_shards()
+      max_workers: if None, read LEROBOT_AGGREGATE_VIDEO_PLAN_WORKERS env
+                   (default min(8, cpu_count())). If 1, runs sequentially
+                   in-process (useful for tests and deterministic logs).
+
+    Returns a summary dict (per-shard timings, byte counts, method counts).
+    Raises ShardExecutionError on any failure (all other shards complete
+    first; partial outputs are NOT cleaned up because the per-shard
+    tmp-then-rename pattern ensures only successful outputs are present).
+    """
+    tasks: list[ShardPlan] = [s for shards in plan.values() for s in shards]
+    if not tasks:
+        return {
+            "n_shards": 0,
+            "n_ok": 0,
+            "wall_s_total": 0.0,
+            "bytes_written_total": 0,
+            "method_counts": {},
+            "max_workers": 0,
+            "per_shard": [],
+        }
+
+    workers = max_workers if max_workers is not None else _pvp_workers_env()
+    workers = min(workers, len(tasks))  # don't over-allocate
+
+    t0 = time.monotonic()
+    results: list[tuple[ShardPlan, ShardResult]] = []
+
+    if workers <= 1:
+        # Sequential path; preferred for tests and small plans.
+        for s in tasks:
+            results.append((s, _execute_shard(s)))
+    else:
+        # Parallel path; one ffmpeg subprocess per shard, up to `workers`
+        # concurrently. Order of completion is non-deterministic.
+        with futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            future_to_shard = {pool.submit(_execute_shard, s): s for s in tasks}
+            for fut in futures.as_completed(future_to_shard):
+                s = future_to_shard[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    r = ShardResult(ok=False, detail=f"worker exception: {exc!r}")
+                results.append((s, r))
+
+    method_counts: dict[str, int] = {}
+    for _, r in results:
+        if r.method:
+            method_counts[r.method] = method_counts.get(r.method, 0) + 1
+
+    summary = {
+        "n_shards": len(results),
+        "n_ok": sum(1 for _, r in results if r.ok),
+        "wall_s_total": time.monotonic() - t0,
+        "bytes_written_total": sum(r.bytes_written for _, r in results if r.ok),
+        "method_counts": method_counts,
+        "max_workers": workers,
+        "per_shard": [
+            {
+                "key": s.key,
+                "dst_chunk": s.dst_chunk,
+                "dst_file": s.dst_file,
+                "dst_path": str(s.dst_path),
+                "n_sources": len(s.sources),
+                "ok": r.ok,
+                "method": r.method,
+                "wall_s": r.wall_s,
+                "bytes_written": r.bytes_written,
+                "detail": r.detail,
+            }
+            for s, r in results
+        ],
+    }
+
+    failures = [(s, r) for s, r in results if not r.ok]
+    if failures:
+        head = "\n".join(
+            f"  {s.key} dst=({s.dst_chunk},{s.dst_file}) n_src={len(s.sources)}: {r.detail}"
+            for s, r in failures[:5]
+        )
+        raise ShardExecutionError(f"{len(failures)}/{len(results)} shards failed:\n{head}")
+
+    return summary
+
+
+# end LOCAL-PATCH(perf-video-plan)
 
 
 def merge_video_feature_info_for_aggregate(all_metadata: list[LeRobotDatasetMetadata]) -> dict[str, dict]:
@@ -225,6 +713,13 @@ def update_meta_data(
         # Fallback to simple offset (backward compatibility for single-file sources)
         df["data/chunk_index"] = df["data/chunk_index"] + data_idx["chunk"]
         df["data/file_index"] = df["data/file_index"] + data_idx["file"]
+    # Per-episode sources store videos/*/from_timestamp as int64, and adding a
+    # fractional second offset to an int64 column floors it silently, shifting
+    # every merged episode's video start. Offsets are seconds, so coerce first.
+    for key in videos_idx:
+        for col in (f"videos/{key}/from_timestamp", f"videos/{key}/to_timestamp"):
+            if col in df.columns:
+                df[col] = df[col].astype("float64")
     for key, video_idx in videos_idx.items():
         # Store original video file indices before updating
         orig_chunk_col = f"videos/{key}/chunk_index"
@@ -355,10 +850,38 @@ def aggregate_datasets(
 
     dst_meta.episodes = {}
 
-    for src_meta in tqdm.tqdm(all_metadata, desc="Copy data and videos"):
-        videos_idx = aggregate_videos(
-            src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size, concatenate_videos
+    _parq_reset()
+
+    # Plan every destination shard up front and build them in parallel, instead
+    # of concatenating per source. Needs shard packing, so it stays off when
+    # concatenate_videos is False.
+    use_plan = _pvp_use_planned_videos() and concatenate_videos and len(video_keys) > 0
+    per_source_view: dict[str, dict[str, dict]] = {}
+    if use_plan:
+        logging.info(
+            "Planned videos enabled: planning shards (workers=%d, timeout_s=%.0f)",
+            _pvp_workers_env(),
+            _pvp_timeout_env(),
         )
+        plan, per_source_view = plan_video_shards(
+            all_metadata, dst_meta.root, video_keys, video_files_size_in_mb, chunk_size
+        )
+        exec_summary = execute_video_plan(plan, _pvp_workers_env())
+        logging.info(
+            "Planned videos: executed %d/%d shards, %d bytes written, methods=%s",
+            exec_summary["n_ok"],
+            exec_summary["n_shards"],
+            exec_summary["bytes_written_total"],
+            exec_summary["method_counts"],
+        )
+
+    for src_meta in tqdm.tqdm(all_metadata, desc="Copy data and videos"):
+        if use_plan:
+            videos_idx = per_source_view[src_meta.repo_id]
+        else:
+            videos_idx = aggregate_videos(
+                src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size, concatenate_videos
+            )
         data_idx = aggregate_data(
             src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size, concatenate_data
         )
@@ -371,6 +894,8 @@ def aggregate_datasets(
 
         dst_meta.info.total_episodes += src_meta.total_episodes
         dst_meta.info.total_frames += src_meta.total_frames
+
+    _parq_finalize_all()
 
     finalize_aggregation(dst_meta, all_metadata)
     logging.info("Aggregation complete.")
@@ -619,6 +1144,134 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     return meta_idx
 
 
+_PARQ_WRITERS: dict = {}
+
+
+def _parq_stream_enabled() -> bool:
+    """Read LEROBOT_AGGREGATE_PARQUET_STREAM at call time. Default False."""
+    raw = os.environ.get("LEROBOT_AGGREGATE_PARQUET_STREAM", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parq_reset() -> None:
+    """Close any leaked writers from a previous call (defensive)."""
+    for entry in list(_PARQ_WRITERS.values()):
+        with contextlib.suppress(Exception):
+            entry["writer"].close()
+    _PARQ_WRITERS.clear()
+
+
+def _parq_finalize_all() -> None:
+    """Close every open writer. Must be called at end of aggregate_datasets()
+    so each destination parquet gets a valid footer."""
+    for entry in _PARQ_WRITERS.values():
+        entry["writer"].close()
+    _PARQ_WRITERS.clear()
+
+
+def _normalize_timestamp_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ``df`` with every ``videos/*/{from,to}_timestamp`` column as float64.
+
+    LOCAL-FIX(timestamp-dtype): the streaming writer pins the schema of the
+    first table it sees and casts later tables to it with ``safe=False``. If
+    that first source carried an int64 ``from_timestamp`` (see
+    ``update_meta_data``), every later float offset was floored on write.
+    Normalising the timestamp columns up front — on the DataFrame, so the
+    parquet's pandas metadata agrees with the arrow schema — makes the pinned
+    schema float regardless of which source arrives first.
+    """
+    cols = [
+        c
+        for c in df.columns
+        if c.startswith("videos/")
+        and (c.endswith("/from_timestamp") or c.endswith("/to_timestamp"))
+        and not pd.api.types.is_float_dtype(df[c])
+    ]
+    if not cols:
+        return df
+    df = df.copy()
+    for c in cols:
+        df[c] = df[c].astype("float64")
+    return df
+
+
+def _append_or_create_parquet_file_streaming(
+    df: pd.DataFrame,
+    src_path: Path,
+    idx: dict[str, int],
+    max_mb: float,
+    chunk_size: int,
+    default_path: str,
+    aggr_root: Path,
+    concatenate: bool = True,
+) -> tuple[dict[str, int], tuple[int, int]]:
+    """Streaming variant of append_or_create_parquet_file().
+
+    Maintains an open pyarrow.ParquetWriter per destination path in
+    _PARQ_WRITERS. Each call writes one row group (the source's rows)
+    and updates a cumulative size estimate. When the estimate would
+    exceed max_mb, closes the current writer and opens a new one at
+    the rotated (chunk, file) index.
+
+    Returns (updated_idx, (dst_chunk, dst_file)) to match
+    append_or_create_parquet_file().
+    """
+    table = pa.Table.from_pandas(_normalize_timestamp_columns(df), preserve_index=False)
+    src_size_mb = get_parquet_file_size_in_mb(src_path)
+
+    dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+
+    entry = _PARQ_WRITERS.get(dst_path)
+    if entry is None:
+        # First write to this destination.
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = pq.ParquetWriter(str(dst_path), table.schema)
+        writer.write_table(table)
+        _PARQ_WRITERS[dst_path] = {
+            "writer": writer,
+            "schema": table.schema,
+            "size_estimate_mb": src_size_mb,
+        }
+        return idx, (idx["chunk"], idx["file"])
+
+    if not concatenate or entry["size_estimate_mb"] + src_size_mb >= max_mb:
+        # Rotate: close current writer, open a new one at the next index.
+        entry["writer"].close()
+        del _PARQ_WRITERS[dst_path]
+        idx["chunk"], idx["file"] = update_chunk_file_indices(idx["chunk"], idx["file"], chunk_size)
+        new_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = pq.ParquetWriter(str(new_path), table.schema)
+        writer.write_table(table)
+        _PARQ_WRITERS[new_path] = {
+            "writer": writer,
+            "schema": table.schema,
+            "size_estimate_mb": src_size_mb,
+        }
+        return idx, (idx["chunk"], idx["file"])
+
+    # Append to the open writer for this destination. Schemas can drift
+    # across sources because `update_meta_data` mutates `from_timestamp` /
+    # `to_timestamp` via `df.at[i, c] += offset`, which pandas treats as
+    # in-place truncation when the column dtype is integer (or vice versa
+    # when the value falls cleanly on an int). The online pd.concat path
+    # silently coerces; we replicate the same behavior via pyarrow.cast
+    # with safe=False so the merger doesn't crash on naturally-mixed-type
+    # source data. Genuinely incompatible types (e.g., string vs int) will
+    # still raise from cast().
+    if table.schema != entry["schema"]:
+        try:
+            table = table.cast(entry["schema"], safe=False)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+            raise ValueError(
+                f"streaming parquet append: schema mismatch for {dst_path} "
+                f"and cast to writer schema failed: {exc}"
+            ) from exc
+    entry["writer"].write_table(table)
+    entry["size_estimate_mb"] += src_size_mb
+    return idx, (idx["chunk"], idx["file"])
+
+
 def append_or_create_parquet_file(
     df: pd.DataFrame,
     src_path: Path,
@@ -655,6 +1308,11 @@ def append_or_create_parquet_file(
         tuple: (updated_idx, (dst_chunk, dst_file)) where updated_idx is the index dict
                and (dst_chunk, dst_file) is the actual destination file the data was written to.
     """
+    if _parq_stream_enabled() and not contains_images and not one_row_group_per_episode:
+        return _append_or_create_parquet_file_streaming(
+            df, src_path, idx, max_mb, chunk_size, default_path, aggr_root, concatenate
+        )
+
     dst_chunk, dst_file = idx["chunk"], idx["file"]
     dst_path = aggr_root / default_path.format(chunk_index=dst_chunk, file_index=dst_file)
 
