@@ -1212,6 +1212,8 @@ import pyarrow.parquet as _parq_papq
 
 
 _PARQ_WRITERS: dict = {}
+# Column order per column set, pinned by the first table seen for that set.
+_PARQ_COLUMN_ORDER: dict[frozenset, list[str]] = {}
 
 
 def _parq_stream_enabled() -> bool:
@@ -1228,6 +1230,7 @@ def _parq_reset() -> None:
         except Exception:
             pass
     _PARQ_WRITERS.clear()
+    _PARQ_COLUMN_ORDER.clear()
 
 
 def _parq_finalize_all() -> None:
@@ -1236,6 +1239,16 @@ def _parq_finalize_all() -> None:
     for entry in _PARQ_WRITERS.values():
         entry["writer"].close()
     _PARQ_WRITERS.clear()
+    _PARQ_COLUMN_ORDER.clear()
+
+
+def _parq_align_columns(table: "_parq_pa.Table") -> "_parq_pa.Table":
+    """Reorder columns to the order pinned by the first table with the same column set.
+    Sources store the same columns in differing orders; pyarrow's cast needs one order.
+    """
+    names = list(table.schema.names)
+    order = _PARQ_COLUMN_ORDER.setdefault(frozenset(names), names)
+    return table if names == order else table.select(order)
 
 
 def _normalize_timestamp_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1280,8 +1293,10 @@ def _append_or_create_parquet_file_streaming(
     exceed max_mb, closes the current writer and opens a new one at
     the rotated (chunk, file) index.
     """
-    table = _parq_pa.Table.from_pandas(
-        _normalize_timestamp_columns(df), preserve_index=False
+    table = _parq_align_columns(
+        _parq_pa.Table.from_pandas(
+            _normalize_timestamp_columns(df), preserve_index=False
+        )
     )
     src_size_mb = get_parquet_file_size_in_mb(src_path)
 
@@ -1333,7 +1348,7 @@ def _append_or_create_parquet_file_streaming(
         try:
             table = table.cast(entry["schema"], safe=False)
         except (_parq_pa.ArrowInvalid, _parq_pa.ArrowNotImplementedError,
-                _parq_pa.ArrowTypeError) as exc:
+                _parq_pa.ArrowTypeError, ValueError) as exc:
             raise ValueError(
                 f"streaming parquet append: schema mismatch for {dst_path} "
                 f"and cast to writer schema failed: {exc}"
